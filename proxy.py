@@ -17,11 +17,13 @@ import ssl
 import os
 import re
 import sys
+import time
 import gzip
 import io
 import ipaddress
 import socket
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,8 +36,39 @@ except ValueError:
     sys.exit(2)
 BASE = os.path.dirname(os.path.abspath(__file__))
 FINANCE_CALENDAR_FILE = Path(os.environ.get("FINANCE_CALENDAR_FILE", os.path.join(BASE, "finance_calendar.yaml"))).expanduser()
+TELEGRAM_FINANCE_ARCHIVE_DIR = Path(os.environ.get(
+    "TELEGRAM_FINANCE_ARCHIVE_DIR",
+    os.path.join(BASE, "..", "state", "telegram_finance_news"),
+)).expanduser()
 MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_RESPONSE_BODY = 12 * 1024 * 1024
+TELEGRAM_FINANCE_TTL_MS = 5 * 60 * 1000
+TELEGRAM_FINANCE_UDP_HOST = os.environ.get("CID_TELEGRAM_FINANCE_UDP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+TELEGRAM_FINANCE_UDP_PORT = int(os.environ.get("CID_TELEGRAM_FINANCE_UDP_PORT", os.environ.get("FINANCE_NEWS_PROXY_UDP_PORT", "5201")) or 5201)
+RECEIVER_UDP_HOST = os.environ.get("CID_RECEIVER_UDP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+RECEIVER_UDP_PORTS = [
+    int(part)
+    for part in re.split(r"[,\s]+", os.environ.get("CID_RECEIVER_UDP_PORTS", os.environ.get("UDP_PORTS", "11000")).strip())
+    if part.isdigit() and int(part) > 0
+]
+RECEIVER_UDP_SOURCE_PORT = int(os.environ.get("CID_RECEIVER_UDP_SOURCE_PORT", "0") or 0)
+FINANCE_AI_PROVIDER = os.environ.get("INFO_PARSER_PROVIDER", os.environ.get("AI_PROVIDER", "deepseek")).strip().lower()
+FINANCE_AI_KEY = (
+    os.environ.get("INFO_PARSER_API_KEY")
+    or (os.environ.get("OPENAI_API_KEY") if FINANCE_AI_PROVIDER == "openai" else os.environ.get("DEEPSEEK_API_KEY"))
+    or ""
+)
+FINANCE_AI_URL = os.environ.get(
+    "INFO_PARSER_URL",
+    "https://api.openai.com/v1/chat/completions"
+    if FINANCE_AI_PROVIDER == "openai"
+    else "https://api.deepseek.com/chat/completions",
+)
+FINANCE_AI_MODEL = os.environ.get(
+    "INFO_PARSER_MODEL",
+    os.environ.get("OPENAI_MODEL", "gpt-4.1") if FINANCE_AI_PROVIDER == "openai" else os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+)
+FINANCE_AI_TIMEOUT = float(os.environ.get("INFO_PARSER_TIMEOUT", "30") or 30)
 ALLOWED_APP_ORIGINS = {
     "http://127.0.0.1:%d" % PORT,
     "http://localhost:%d" % PORT,
@@ -46,6 +79,12 @@ FORWARD_HEADERS = {"authorization", "x-api-key", "anthropic-version", "x-goog-ap
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+TELEGRAM_FINANCE_PROMPT_FILE = Path(os.environ.get(
+    "TELEGRAM_FINANCE_PROMPT_FILE",
+    os.path.join(BASE, "prompts", "telegram_finance_prompt.txt"),
+)).expanduser()
+TELEGRAM_FINANCE_PROMPT = TELEGRAM_FINANCE_PROMPT_FILE.read_text(encoding="utf-8").strip()
 
 # 部分新闻接口要求带来源页,否则返回 403
 REFERERS = {
@@ -62,6 +101,9 @@ REFERERS = {
 
 # 阿里云 WAF JS 挑战的 cookie 缓存(如深潮 TechFlow)
 ACW_COOKIES = {}
+TELEGRAM_FINANCE_ITEMS = []
+TELEGRAM_FINANCE_LOCK = threading.Lock()
+TELEGRAM_FINANCE_ARCHIVE_LOCK = threading.Lock()
 
 
 def _yaml_value(value):
@@ -138,6 +180,264 @@ def load_finance_calendar_events(path=FINANCE_CALENDAR_FILE):
         if name and ts_ms > 0:
             events.append({"n": name, "t": ts_ms})
     return events
+
+
+def _json_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "重要", "important"}
+
+
+def _direction(value):
+    value = str(value or "").strip().lower()
+    return value if value in {"increase", "decrease", "neutral", "unclear"} else "unclear"
+
+
+def _int_range(value, default, low, high):
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        number = default
+    return max(low, min(high, number))
+
+
+def _string_list(value):
+    return [str(item).strip() for item in value if str(item).strip()] if isinstance(value, list) else []
+
+
+def _ai_json(content):
+    text = str(content or "").replace("```json", "").replace("```", "").strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("AI did not return JSON")
+    result = json.loads(text[start : end + 1])
+    return result if isinstance(result, dict) else {}
+
+
+def _parse_time_ms(value):
+    if isinstance(value, (int, float)) and value > 0:
+        return int(value if value > 10_000_000_000 else value * 1000)
+    text = str(value or "").strip()
+    if not text:
+        return int(time.time() * 1000)
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return int(time.time() * 1000)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _archive_day(value):
+    text = str(value or "").strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        return text[:10]
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _archive_telegram_finance_news(payload, *, result=None, error=None):
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return
+    record = {
+        "received_at": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": str(payload.get("timestamp") or "").strip(),
+        "source": str(payload.get("source") or "telegram").strip() or "telegram",
+        "chat_name": str(payload.get("chat_name") or "Telegram").strip() or "Telegram",
+        "msg_id": payload.get("msg_id"),
+        "text": text,
+    }
+    if isinstance(result, dict):
+        record["important"] = bool(result.get("important"))
+        record["sent"] = bool(result.get("sent"))
+        record["ai"] = result.get("record") if isinstance(result.get("record"), dict) else {}
+    if error:
+        record["error"] = str(error)
+    path = TELEGRAM_FINANCE_ARCHIVE_DIR / f"{_archive_day(record['timestamp'])}.jsonl"
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    with TELEGRAM_FINANCE_ARCHIVE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+
+
+def _remember_telegram_finance_item(payload):
+    text = str(payload.get("text") or "").strip()
+    chat_name = str(payload.get("chat_name") or "Telegram").strip() or "Telegram"
+    msg_id = str(payload.get("msg_id") or int(time.time() * 1000)).strip()
+    timestamp = str(payload.get("timestamp") or "").strip()
+    row = {
+        "id": f"tg:{chat_name}:{msg_id}",
+        "time": _parse_time_ms(payload.get("timestamp")),
+        "timestamp": timestamp,
+        "title": text[:90],
+        "body": text,
+        "url": "#",
+        "src": chat_name,
+    }
+    with TELEGRAM_FINANCE_LOCK:
+        existing = next((idx for idx, item in enumerate(TELEGRAM_FINANCE_ITEMS) if item.get("id") == row["id"]), -1)
+        if existing >= 0:
+            TELEGRAM_FINANCE_ITEMS[existing] = row
+        else:
+            TELEGRAM_FINANCE_ITEMS.insert(0, row)
+            del TELEGRAM_FINANCE_ITEMS[200:]
+    return row
+
+
+def telegram_finance_feed_items():
+    with TELEGRAM_FINANCE_LOCK:
+        return [dict(item) for item in TELEGRAM_FINANCE_ITEMS]
+
+
+def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
+    return {
+        "source": "telegram",
+        "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "timestamp": timestamp,
+        "chat_name": str(chat_name or "").strip(),
+        "msg_id": msg_id,
+        "important": _json_bool(result.get("important")),
+        "summary": str(result.get("summary") or "").strip(),
+        "direction": str(result.get("direction") or "中性").strip(),
+        "st": str(result.get("st") or "中性").strip(),
+        "lt": str(result.get("lt") or "中性").strip(),
+        "level": _int_range(result.get("level"), 1, 1, 5),
+        "conf": _int_range(result.get("conf"), 0, 0, 100),
+        "coins": _string_list(result.get("coins")),
+        "cat": str(result.get("cat") or "其他").strip(),
+        "news_label": _string_list(result.get("news_label")),
+        "news_point": str(result.get("news_point") or "").strip(),
+        "news_implication": str(result.get("news_implication") or "").strip(),
+        "btc_price": _direction(result.get("btc_price")),
+        "us_tech_stocks": _direction(result.get("us_tech_stocks")),
+        "korean_tech_stocks": _direction(result.get("korean_tech_stocks")),
+        "action": str(result.get("action") or "none").strip().lower(),
+        "bias": str(result.get("bias") or "n/a").strip().lower(),
+        "reason_tags": _string_list(result.get("reason_tags")),
+        "event_timing": str(result.get("event_timing") or "unknown").strip().lower(),
+        "priced_in": _json_bool(result.get("priced_in")),
+        "binary_event_risk": _json_bool(result.get("binary_event_risk")),
+        "gap": str(result.get("gap") or "none").strip(),
+        "why": str(result.get("why") or "").strip(),
+        "reverse": str(result.get("reverse") or "").strip(),
+        "raw_text": text,
+    }
+
+
+def build_telegram_finance_warning_packet(record):
+    msg_id = str(record.get("msg_id") or "").strip()
+    chat_name = str(record.get("chat_name") or "telegram").strip() or "telegram"
+    warning_id = f"market_news:telegram:{chat_name}:{msg_id or record.get('saved_at') or time.time()}"
+    message = (
+        f"{record.get('summary') or record.get('raw_text') or ''} | "
+        f"BTC:{record.get('btc_price') or 'unclear'} | "
+        f"美股:{record.get('us_tech_stocks') or 'unclear'} | "
+        f"韩股:{record.get('korean_tech_stocks') or 'unclear'}"
+    )
+    return {
+        "type": "warning_message",
+        "warning_id": warning_id,
+        "warning_type": "market_news",
+        "title": "Market News",
+        "trader_name": chat_name,
+        "message": message,
+        "price_direction": record.get("btc_price") or "unclear",
+        "ttl_ms": TELEGRAM_FINANCE_TTL_MS,
+        "timestamp": record.get("timestamp"),
+        "raw_text": record.get("raw_text"),
+    }
+
+
+def _post_finance_ai(text):
+    if not FINANCE_AI_KEY:
+        raise RuntimeError(f"{FINANCE_AI_MODEL} API key not set")
+    payload = {
+        "model": FINANCE_AI_MODEL,
+        "temperature": 0.2,
+        "max_tokens": 600,
+        "messages": [
+            {"role": "system", "content": "You classify Telegram finance news impact for BTC and US/Korean tech stocks."},
+            {"role": "user", "content": TELEGRAM_FINANCE_PROMPT.replace("{message}", str(text or ""))},
+        ],
+    }
+    req = urllib.request.Request(
+        FINANCE_AI_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {FINANCE_AI_KEY}"},
+    )
+    with urllib.request.urlopen(req, timeout=FINANCE_AI_TIMEOUT) as resp:
+        data = json.loads(resp.read(MAX_RESPONSE_BODY).decode("utf-8"))
+    return _ai_json(data["choices"][0]["message"]["content"])
+
+
+def _send_receiver_packet(packet):
+    data = json.dumps(packet, ensure_ascii=False).encode("utf-8")
+    for port in RECEIVER_UDP_PORTS or [11000]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if RECEIVER_UDP_SOURCE_PORT > 0:
+                sock.bind(("127.0.0.1", RECEIVER_UDP_SOURCE_PORT))
+            sock.sendto(data, (RECEIVER_UDP_HOST, port))
+        finally:
+            sock.close()
+
+
+def process_telegram_finance_news(payload):
+    if str(payload.get("source") or "telegram").strip().lower() != "telegram":
+        raise ValueError("source must be telegram")
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required")
+    ai_result = _post_finance_ai(text)
+    record = telegram_finance_news_record(
+        ai_result,
+        chat_name=payload.get("chat_name") or "telegram",
+        msg_id=payload.get("msg_id"),
+        text=text,
+        timestamp=payload.get("timestamp") or datetime.utcnow().isoformat(timespec="seconds"),
+    )
+    sent = False
+    if record.get("important") and _direction(record.get("btc_price")) in {"increase", "decrease"}:
+        _send_receiver_packet(build_telegram_finance_warning_packet(record))
+        sent = True
+    return {"ok": True, "important": bool(record.get("important")), "sent": sent, "record": record}
+
+
+def ingest_telegram_finance_packet(payload):
+    if str(payload.get("type") or "").strip().lower() != "telegram_finance_news":
+        raise ValueError("packet type must be telegram_finance_news")
+    _remember_telegram_finance_item(payload)
+    try:
+        result = process_telegram_finance_news(payload)
+    except Exception as exc:
+        _archive_telegram_finance_news(payload, error=exc)
+        raise
+    _archive_telegram_finance_news(payload, result=result)
+    return result
+
+
+def _telegram_finance_udp_loop():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((TELEGRAM_FINANCE_UDP_HOST, TELEGRAM_FINANCE_UDP_PORT))
+    print(f"[proxy] telegram finance UDP listening on {TELEGRAM_FINANCE_UDP_HOST}:{TELEGRAM_FINANCE_UDP_PORT}")
+    while True:
+        try:
+            data, addr = sock.recvfrom(MAX_REQUEST_BODY)
+            payload = json.loads(data.decode("utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            result = ingest_telegram_finance_packet(payload)
+            print(
+                f"[proxy] telegram finance msg chat={payload.get('chat_name') or '-'} "
+                f"msg_id={payload.get('msg_id') or '-'} sent={result.get('sent')}"
+            )
+        except Exception as exc:
+            print(f"[proxy] telegram finance UDP failed: {exc}")
 
 
 def is_public_https_url(url):
@@ -220,6 +520,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for allowed in ALLOWED_APP_ORIGINS
         )
 
+    def _is_local_request(self):
+        try:
+            return ipaddress.ip_address(self.client_address[0]).is_loopback
+        except ValueError:
+            return False
+
     def _cors(self):
         origin = (self.headers.get("Origin") or "").rstrip("/")
         if origin in ALLOWED_APP_ORIGINS:
@@ -276,12 +582,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._reply(403, b'{"error":"origin not allowed"}')
             data = json.dumps(load_finance_calendar_events(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             return self._reply(200, data)
+        if path == "/telegram-finance-news":
+            if not self._is_app_request():
+                return self._reply(403, b'{"error":"origin not allowed"}')
+            data = json.dumps(telegram_finance_feed_items(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            return self._reply(200, data)
         if path == "/ping":
             return self._reply(200, b'{"ok":true,"app":"crypto-intelligence-desk","version":"1.0.1"}')
         self._reply(404, b'{"error":"not found"}')
 
     def do_POST(self):
-        if urllib.parse.urlparse(self.path).path == "/p":
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/telegram-finance-news":
+            if not self._is_local_request():
+                return self._reply(403, b'{"error":"local requests only"}')
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > MAX_REQUEST_BODY:
+                    return self._reply(413, b'{"error":"request body too large"}')
+                payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+                result = process_telegram_finance_news(payload if isinstance(payload, dict) else {})
+                data = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                return self._reply(200, data)
+            except ValueError as exc:
+                return self._reply(400, json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
+            except Exception as exc:
+                print(f"[proxy] telegram finance news failed: {exc}")
+                return self._reply(500, json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"))
+        if path == "/p":
             if not self._is_app_request():
                 return self._reply(403, b'{"error":"origin not allowed"}')
             return self._forward("POST")
@@ -384,9 +712,11 @@ if __name__ == "__main__":
     print("=" * 52)
     print("   币圈新闻监控台 · 本地代理已启动")
     print("   请在浏览器打开:  http://127.0.0.1:%d" % PORT)
+    print("   Telegram 财经消息 UDP: %s:%d" % (TELEGRAM_FINANCE_UDP_HOST, TELEGRAM_FINANCE_UDP_PORT))
     print("   关闭本窗口即停止服务")
     print("=" * 52)
     try:
+        threading.Thread(target=_telegram_finance_udp_loop, daemon=True, name="telegram-finance-udp").start()
         ThreadingServer(("127.0.0.1", PORT), Handler).serve_forever()
     except KeyboardInterrupt:
         print("\n监控台已停止。")

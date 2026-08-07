@@ -532,7 +532,7 @@ html[data-theme="light"] .pbtn{background:#dcecf4;color:#24536b;border-color:#76
       <div>
         <div class="eyebrow">Live intelligence stream</div>
         <h1 class="desk-title">实时情报流</h1>
-        <p class="desk-sub">跨信源聚合 · 自动去重 · AI 影响研判</p>
+        <p class="desk-sub">Telegram 信源 · 自动去重 · AI 影响研判</p>
       </div>
       <div class="metric-grid" aria-label="情报概览">
         <div class="metric"><div class="n" id="metricTotal">0</div><div class="l">当前情报</div></div>
@@ -617,12 +617,12 @@ const DEF_SETTINGS={
   prov:{deepseek:{},anthropic:{},openai:{},gemini:{},grok:{},custom:{}},
   deep:false, deepProvider:'anthropic',
   pollSec:30, sound:true, theme:'dark',
-  srcOn:{jinse:false,blockbeats:false,panews:true,binance:true,odaily:true,ctcn:true,techflow:true,catcher:true},
+  srcOn:{telegram:true},
   srcUrl:{}
 };
 let S;
 function loadS(){try{S=Object.assign({},DEF_SETTINGS,JSON.parse(localStorage.getItem(STORAGE_KEYS.settings)||'{}'));}catch(e){S=Object.assign({},DEF_SETTINGS)}
-  S.prov=Object.assign({},DEF_SETTINGS.prov,S.prov);S.srcOn=Object.assign({},DEF_SETTINGS.srcOn,S.srcOn);S.srcUrl=S.srcUrl||{};
+  S.prov=Object.assign({},DEF_SETTINGS.prov,S.prov);S.srcOn={telegram:true};S.srcUrl={};
   S.theme=S.theme==='light'?'light':'dark';}
 function saveS(){localStorage.setItem(STORAGE_KEYS.settings,JSON.stringify(S));}
 function applyTheme(){
@@ -731,6 +731,10 @@ function scheduleModelDetection(delay=700){
 
 /* ================= 新闻源 ================= */
 const SOURCES={
+  telegram:{name:'Telegram',
+    urls:['/telegram-finance-news'],
+    parse(j){const arr=Array.isArray(j)?j:[];
+      return arr.map(x=>({id:'tg'+(x.id||x.msg_id||x.title),time:+x.time||Date.now(),timestamp:strip(x.timestamp||''),title:strip(x.title||x.body||''),body:strip(x.body||''),url:x.url||'#',src:x.src||'Telegram'}))}},
   jinse:{name:'金色财经',
     urls:['https://api.jinse.cn/noah/v2/lives?limit=30&reading=false&source=web&flag=down&id=0&category=0',
           'https://api.jinse.com/noah/v2/lives?limit=30&reading=false&source=web&flag=down&id=0&category=0'],
@@ -804,20 +808,20 @@ function parseRSS(text,k){
 const NEWS=new Map();          // id -> item
 const seenTitle=new Set();     // 跨源去重
 let firstPoll=true, pollTimer=null;
+const ACTIVE_SOURCE_KEYS=['telegram'];
 const titleHash=t=>strip(t).replace(/[\s\p{P}]/gu,'').slice(0,42);
 const itemHash=value=>{let h=2166136261;for(const ch of String(value)){h^=ch.codePointAt(0);h=Math.imul(h,16777619)}return(h>>>0).toString(36)};
 
 function setHealth(k,ok,msg){const el=document.getElementById('sd_'+k);if(!el)return;
   el.className=ok?'ok':'bad';el.title=SOURCES[k].name+(ok?' · 正常':' · 失败: '+(msg||''));updateDashboard()}
-function renderSrcDots(){$('#srcDots').innerHTML=Object.keys(SOURCES)
-  .filter(k=>S.srcOn[k])
+function renderSrcDots(){$('#srcDots').innerHTML=ACTIVE_SOURCE_KEYS
   .map(k=>`<span id="sd_${k}"><i></i>${SOURCES[k].name}</span>`).join('');updateDashboard()}
 
 async function fetchSource(k){
   let lastErr='';
   for(const u of candidates(k)){
     try{
-      const r=await fetch(P(u));
+      const r=await fetch(u.startsWith('/')?u:P(u));
       const text=(await r.text()).trim();
       if(!r.ok)throw new Error('HTTP '+r.status+' '+text.slice(0,80));
       let items;
@@ -836,7 +840,7 @@ async function fetchSource(k){
 }
 
 async function pollAll(){
-  const keys=Object.keys(SOURCES).filter(k=>S.srcOn[k]);
+  const keys=ACTIVE_SOURCE_KEYS;
   const res=await Promise.all(keys.map(fetchSource));
   let items=res.flat().sort((a,b)=>a.time-b.time);   // 旧->新,保证 prepend 后最新在顶
   const fresh=[];
@@ -920,7 +924,7 @@ function renderCard(it,isNew){
   const el=document.createElement('div');
   el.className='card'+(isNew?' is-new':'');el.id='c_'+it.id;el.dataset.id=it.id;
   el.innerHTML=`
-    <div class="meta"><span class="time">${fmtT(it.time)}</span><span class="src">${esc(it.src)}</span>
+    <div class="meta"><span class="time">${esc(it.timestamp||fmtT(it.time))}</span><span class="src">${esc(it.src)}</span>
       ${isNew?'<span class="badge-new">NEW</span>':''}
       <span class="spacer" style="flex:1"></span>
       <a class="srclink" href="${esc(safeLink(it.url))}" target="_blank" rel="noopener noreferrer">原文 ↗</a></div>
@@ -1048,11 +1052,8 @@ function renderSettings(){
   <div class="msec"><h4>监控行为</h4>
     <div class="frow"><label>界面主题</label><select id="sTheme"><option value="dark" ${S.theme==='dark'?'selected':''}>夜间模式</option><option value="light" ${S.theme==='light'?'selected':''}>日间模式</option></select></div>
     <div class="frow"><label>轮询间隔(秒)</label><input type="number" id="sPoll" min="10" max="600" value="${S.pollSec}"></div>
-    <div class="frow"><label>新闻源</label>${Object.keys(SOURCES).map(k=>`<label class="tgl"><input type="checkbox" class="sSrc" data-k="${k}" ${S.srcOn[k]?'checked':''}>${SOURCES[k].name}</label>`).join('')}</div>
+    <div class="frow"><label>新闻源</label><span class="note" style="margin:0">Telegram</span></div>
     <div class="frow"><label class="tgl"><input type="checkbox" id="sSound" ${S.sound?'checked':''}> 重大新闻声音告警</label><button class="sbtn" onclick="beep(2)">试听</button></div>
-  </div>
-  <div class="msec"><h4>高级 · 数据源接口地址(留空用默认)</h4>
-    ${Object.keys(SOURCES).map(k=>`<div class="frow"><label>${SOURCES[k].name}</label><input type="text" class="sUrl" data-k="${k}" value="${esc(S.srcUrl[k]||'')}" placeholder="${esc(SOURCES[k].urls[0])}"></div>`).join('')}
   </div>
   <div class="msec"><button class="pbtn" id="btnSaveSet">保存设置</button> <button class="sbtn danger" id="btnClearLocal" type="button">清除全部本地数据</button> <span class="note" id="saveMsg" style="margin-left:8px"></span></div>`;
 
@@ -1090,8 +1091,7 @@ function renderSettings(){
     S.deep=$('#sDeep').checked;S.deepProvider=$('#sDeepProv').value;
     S.pollSec=Math.max(10,+$('#sPoll').value||30);
     S.sound=$('#sSound').checked;S.theme=$('#sTheme').value==='light'?'light':'dark';
-    document.querySelectorAll('.sSrc').forEach(el=>S.srcOn[el.dataset.k]=el.checked);
-    document.querySelectorAll('.sUrl').forEach(el=>{const v=el.value.trim();if(v)S.srcUrl[el.dataset.k]=v;else delete S.srcUrl[el.dataset.k]});
+    S.srcOn={telegram:true};S.srcUrl={};
     saveS();
     $('#saveMsg').textContent='✓ 已保存';
     $('#setupBand').style.display=hasKey()?'none':'';
