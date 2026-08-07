@@ -1,0 +1,13 @@
+company_finance_reports:
+  - symbol: AAPL
+    name: Apple 财报
+    time_utc:
+  - symbol: MSFT
+    name: Microsoft 财报
+    time_utc:
+  - symbol: NVDA
+    name: Nvidia 财报
+    time_utc: 2026-08-26T20:00:00Z
+  - symbol: TSLA
+    name: Tesla 财报
+    time_utc:
