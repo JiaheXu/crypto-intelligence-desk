@@ -27,15 +27,6 @@ if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) 
   exit 1
 fi
 
-(
-  sleep 1
-  if command -v open >/dev/null 2>&1; then
-    open "$APP_URL"
-  elif command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$APP_URL"
-  fi
-) >/dev/null 2>&1 &
-
 cd "$APP_DIR"
 mkdir -p "$(dirname "$FINANCE_CALENDAR_FILE")"
 mkdir -p "$TELEGRAM_FINANCE_ARCHIVE_DIR"

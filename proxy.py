@@ -69,6 +69,7 @@ FINANCE_AI_MODEL = os.environ.get(
     os.environ.get("OPENAI_MODEL", "gpt-4.1") if FINANCE_AI_PROVIDER == "openai" else os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
 )
 FINANCE_AI_TIMEOUT = float(os.environ.get("INFO_PARSER_TIMEOUT", "30") or 30)
+FINANCE_AI_JSON_RETRIES = int(os.environ.get("INFO_PARSER_JSON_RETRIES", "3") or 3)
 ALLOWED_APP_ORIGINS = {
     "http://127.0.0.1:%d" % PORT,
     "http://localhost:%d" % PORT,
@@ -85,6 +86,10 @@ TELEGRAM_FINANCE_PROMPT_FILE = Path(os.environ.get(
     os.path.join(BASE, "prompts", "telegram_finance_prompt.txt"),
 )).expanduser()
 TELEGRAM_FINANCE_PROMPT = TELEGRAM_FINANCE_PROMPT_FILE.read_text(encoding="utf-8").strip()
+
+
+class RetryableAIJsonError(ValueError):
+    pass
 
 # 部分新闻接口要求带来源页,否则返回 403
 REFERERS = {
@@ -210,8 +215,11 @@ def _ai_json(content):
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end <= start:
-        raise ValueError("AI did not return JSON")
-    result = json.loads(text[start : end + 1])
+        raise RetryableAIJsonError("AI 未返回 JSON")
+    try:
+        result = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise RetryableAIJsonError("AI 返回的 JSON 格式无效") from exc
     return result if isinstance(result, dict) else {}
 
 
@@ -285,6 +293,56 @@ def _remember_telegram_finance_item(payload):
             TELEGRAM_FINANCE_ITEMS.insert(0, row)
             del TELEGRAM_FINANCE_ITEMS[200:]
     return row
+
+
+def _archive_row_payload(row):
+    text = str(row.get("text") or "").strip()
+    if not text:
+        return None
+    timestamp = str(row.get("timestamp") or row.get("received_at") or "").strip()
+    chat_name = str(row.get("chat_name") or row.get("source") or "Telegram").strip() or "Telegram"
+    msg_id = row.get("msg_id") or row.get("received_at") or f"archive:{timestamp}:{abs(hash(text))}"
+    return {
+        "type": "telegram_finance_news",
+        "source": str(row.get("source") or "telegram").strip() or "telegram",
+        "chat_name": chat_name,
+        "msg_id": msg_id,
+        "text": text,
+        "timestamp": timestamp,
+    }
+
+
+def load_recent_telegram_finance_archive(limit=5):
+    rows = []
+    try:
+        paths = sorted(TELEGRAM_FINANCE_ARCHIVE_DIR.glob("*.jsonl"), reverse=True)
+    except OSError as exc:
+        print(f"[proxy] failed to list telegram finance archive: {exc}")
+        return 0
+    for path in paths:
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"[proxy] failed to read telegram finance archive {path}: {exc}")
+            continue
+        for line in reversed(lines):
+            if len(rows) >= limit:
+                break
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                payload = _archive_row_payload(row)
+                if payload:
+                    rows.append(payload)
+        if len(rows) >= limit:
+            break
+    for payload in reversed(rows):
+        _remember_telegram_finance_item(payload)
+    if rows:
+        print(f"[proxy] loaded {len(rows)} telegram finance archive messages from {TELEGRAM_FINANCE_ARCHIVE_DIR}")
+    return len(rows)
 
 
 def telegram_finance_feed_items():
@@ -369,9 +427,20 @@ def _post_finance_ai(text):
         method="POST",
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {FINANCE_AI_KEY}"},
     )
-    with urllib.request.urlopen(req, timeout=FINANCE_AI_TIMEOUT) as resp:
-        data = json.loads(resp.read(MAX_RESPONSE_BODY).decode("utf-8"))
-    return _ai_json(data["choices"][0]["message"]["content"])
+    last_error = None
+    for attempt in range(FINANCE_AI_JSON_RETRIES + 1):
+        if attempt:
+            print(f"[proxy] AI JSON retry {attempt}/{FINANCE_AI_JSON_RETRIES}")
+            time.sleep(0.5 * attempt)
+        try:
+            with urllib.request.urlopen(req, timeout=FINANCE_AI_TIMEOUT) as resp:
+                data = json.loads(resp.read(MAX_RESPONSE_BODY).decode("utf-8"))
+            return _ai_json(data["choices"][0]["message"]["content"])
+        except RetryableAIJsonError as exc:
+            last_error = exc
+            if attempt >= FINANCE_AI_JSON_RETRIES:
+                break
+    raise RuntimeError(f"自动重试 {FINANCE_AI_JSON_RETRIES} 次后仍未返回有效 JSON") from last_error
 
 
 def _send_receiver_packet(packet):
@@ -393,6 +462,7 @@ def process_telegram_finance_news(payload):
     if not text:
         raise ValueError("text is required")
     ai_result = _post_finance_ai(text)
+    print(f"[proxy] telegram finance AI result: {json.dumps(ai_result, ensure_ascii=False, separators=(',', ':'))}")
     record = telegram_finance_news_record(
         ai_result,
         chat_name=payload.get("chat_name") or "telegram",
@@ -431,6 +501,10 @@ def _telegram_finance_udp_loop():
             payload = json.loads(data.decode("utf-8"))
             if not isinstance(payload, dict):
                 continue
+            print(
+                f"[proxy] telegram finance received chat={payload.get('chat_name') or '-'} "
+                f"msg_id={payload.get('msg_id') or '-'} text={payload.get('text') or ''}"
+            )
             result = ingest_telegram_finance_packet(payload)
             print(
                 f"[proxy] telegram finance msg chat={payload.get('chat_name') or '-'} "
@@ -573,6 +647,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html"):
             return self._serve_file("index.html", "text/html; charset=utf-8")
+        if path == "/favicon.ico":
+            return self._reply(204, b"", "image/x-icon")
         if path == "/p":
             if not self._is_app_request():
                 return self._reply(403, b'{"error":"origin not allowed"}')
@@ -697,7 +773,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if "/p?u=" in msg:
                 host = urllib.parse.urlparse(
                     urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)["u"][0]).netloc
+                if host == "api.deepseek.com":
+                    return
                 msg = "-> " + host
+            elif msg.startswith('"GET /telegram-finance-news '):
+                return
             sys.stdout.write("[proxy] %s\n" % msg)
         except Exception:
             pass
@@ -716,6 +796,7 @@ if __name__ == "__main__":
     print("   关闭本窗口即停止服务")
     print("=" * 52)
     try:
+        load_recent_telegram_finance_archive(limit=5)
         threading.Thread(target=_telegram_finance_udp_loop, daemon=True, name="telegram-finance-udp").start()
         ThreadingServer(("127.0.0.1", PORT), Handler).serve_forever()
     except KeyboardInterrupt:

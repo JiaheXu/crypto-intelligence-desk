@@ -154,6 +154,128 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertEqual(rows[0]["ai"]["news_label"], ["macro_rate_policy"])
         self.assertEqual(rows[0]["ai"]["btc_price"], "increase")
 
+    def test_loads_recent_telegram_finance_archive_into_feed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_dir = proxy.TELEGRAM_FINANCE_ARCHIVE_DIR
+            original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+            try:
+                proxy.TELEGRAM_FINANCE_ARCHIVE_DIR = Path(tmp)
+                proxy.TELEGRAM_FINANCE_ITEMS.clear()
+                older = Path(tmp) / "2026-07-06.jsonl"
+                newer = Path(tmp) / "2026-07-07.jsonl"
+                older.write_text(
+                    "\n".join(
+                        json.dumps(
+                            {
+                                "timestamp": f"2026-07-06 10:0{i}:00",
+                                "chat_name": "tradfi",
+                                "msg_id": f"old-{i}",
+                                "text": f"old msg {i}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        for i in range(3)
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                newer.write_text(
+                    "\n".join(
+                        json.dumps(
+                            {
+                                "timestamp": f"2026-07-07 10:0{i}:00",
+                                "chat_name": "tradfi",
+                                "msg_id": f"new-{i}",
+                                "text": f"new msg {i}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        for i in range(4)
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                loaded = proxy.load_recent_telegram_finance_archive(limit=5)
+                feed = proxy.telegram_finance_feed_items()
+            finally:
+                proxy.TELEGRAM_FINANCE_ARCHIVE_DIR = original_dir
+                proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+
+        self.assertEqual(loaded, 5)
+        self.assertEqual([row["body"] for row in feed], ["new msg 3", "new msg 2", "new msg 1", "new msg 0", "old msg 2"])
+
+    def test_finance_ai_retries_invalid_json_response(self):
+        original_key = proxy.FINANCE_AI_KEY
+        original_urlopen = proxy.urllib.request.urlopen
+        original_sleep = proxy.time.sleep
+        calls = []
+
+        class Response:
+            def __init__(self, content):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps({"choices": [{"message": {"content": self.content}}]}).encode("utf-8")
+
+        def fake_urlopen(_req, timeout):
+            calls.append(timeout)
+            return Response("not json" if len(calls) == 1 else '{"important":true,"summary":"ok"}')
+
+        try:
+            proxy.FINANCE_AI_KEY = "test-key"
+            proxy.urllib.request.urlopen = fake_urlopen
+            proxy.time.sleep = lambda _seconds: None
+
+            result = proxy._post_finance_ai("hello")
+        finally:
+            proxy.FINANCE_AI_KEY = original_key
+            proxy.urllib.request.urlopen = original_urlopen
+            proxy.time.sleep = original_sleep
+
+        self.assertEqual(result["summary"], "ok")
+        self.assertEqual(len(calls), 2)
+
+    def test_finance_ai_stops_after_json_retry_limit(self):
+        original_key = proxy.FINANCE_AI_KEY
+        original_urlopen = proxy.urllib.request.urlopen
+        original_sleep = proxy.time.sleep
+        calls = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return json.dumps({"choices": [{"message": {"content": "not json"}}]}).encode("utf-8")
+
+        def fake_urlopen(_req, timeout):
+            calls.append(1)
+            return Response()
+
+        try:
+            proxy.FINANCE_AI_KEY = "test-key"
+            proxy.urllib.request.urlopen = fake_urlopen
+            proxy.time.sleep = lambda _seconds: None
+
+            with self.assertRaisesRegex(RuntimeError, "自动重试 3 次后仍未返回有效 JSON"):
+                proxy._post_finance_ai("hello")
+        finally:
+            proxy.FINANCE_AI_KEY = original_key
+            proxy.urllib.request.urlopen = original_urlopen
+            proxy.time.sleep = original_sleep
+
+        self.assertEqual(len(calls), 4)
+
     def test_page_forces_telegram_as_only_source(self):
         source = (Path(__file__).resolve().parents[1] / "index.html").read_text(encoding="utf-8")
 
