@@ -51,6 +51,17 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertEqual(packet["price_direction"], "increase")
         self.assertIn("BTC:increase | 美股:increase | 韩股:increase", packet["message"])
 
+    def test_telegram_finance_news_record_marks_unrelated_messages(self):
+        record = proxy.telegram_finance_news_record(
+            {"important": False, "unrelated": True, "summary": "无关消息"},
+            chat_name="tradfi",
+            msg_id=124,
+            text="local restaurant opens",
+            timestamp="2026-07-07 14:01:00",
+        )
+
+        self.assertTrue(record["unrelated"])
+
     def test_udp_telegram_finance_news_is_stored_and_processed(self):
         sent = []
         original_ai = proxy._post_finance_ai
@@ -90,6 +101,36 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertEqual(feed[0]["timestamp"], "2026-07-07 14:00:00")
         self.assertEqual(feed[0]["title"], "Fed cuts rates")
         self.assertEqual(feed[0]["body"], "Fed cuts rates")
+
+    def test_udp_discord_finance_news_is_stored_and_processed(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy._post_finance_ai = lambda _text: {"important": False, "summary": "ok"}
+            proxy._send_receiver_packet = lambda _packet: None
+
+            result = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "discord",
+                    "chat_name": "Guild#macro",
+                    "msg_id": 456,
+                    "text": "Discord macro update",
+                    "timestamp": "2026-07-07 15:00:00",
+                }
+            )
+
+            feed = proxy.telegram_finance_feed_items()
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(feed[0]["src"], "Guild#macro")
+        self.assertEqual(feed[0]["body"], "Discord macro update")
 
     def test_telegram_finance_news_archives_one_jsonl_file_per_day(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -301,6 +342,7 @@ class FinanceCalendarTests(unittest.TestCase):
         prompt = (root / "prompts" / "telegram_finance_prompt.txt").read_text(encoding="utf-8")
 
         for field in (
+            '"unrelated"',
             '"direction"',
             '"st"',
             '"lt"',
@@ -325,6 +367,13 @@ class FinanceCalendarTests(unittest.TestCase):
 
         for duplicate in ('"symbols"', '"markets"', '"cross_asset_effect"', '"trading_action"'):
             self.assertNotIn(duplicate, prompt)
+
+        self.assertIn("Do not retry", prompt)
+        self.assertIn("earnings_event", prompt)
+        self.assertIn("policy_intervention", prompt)
+        self.assertIn("market_session_signal", prompt)
+        self.assertIn("FedWatch/rate-odds", prompt)
+        self.assertNotIn("earnings_financials", prompt)
 
 
 if __name__ == "__main__":

@@ -358,6 +358,7 @@ def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
         "chat_name": str(chat_name or "").strip(),
         "msg_id": msg_id,
         "important": _json_bool(result.get("important")),
+        "unrelated": _json_bool(result.get("unrelated")),
         "summary": str(result.get("summary") or "").strip(),
         "direction": str(result.get("direction") or "中性").strip(),
         "st": str(result.get("st") or "中性").strip(),
@@ -456,8 +457,9 @@ def _send_receiver_packet(packet):
 
 
 def process_telegram_finance_news(payload):
-    if str(payload.get("source") or "telegram").strip().lower() != "telegram":
-        raise ValueError("source must be telegram")
+    source = str(payload.get("source") or "telegram").strip().lower()
+    if source not in {"telegram", "discord"}:
+        raise ValueError("source must be telegram or discord")
     text = str(payload.get("text") or "").strip()
     if not text:
         raise ValueError("text is required")
@@ -474,7 +476,7 @@ def process_telegram_finance_news(payload):
     if record.get("important") and _direction(record.get("btc_price")) in {"increase", "decrease"}:
         _send_receiver_packet(build_telegram_finance_warning_packet(record))
         sent = True
-    return {"ok": True, "important": bool(record.get("important")), "sent": sent, "record": record}
+    return {"ok": True, "important": bool(record.get("important")), "unrelated": bool(record.get("unrelated")), "sent": sent, "record": record}
 
 
 def ingest_telegram_finance_packet(payload):

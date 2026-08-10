@@ -7,6 +7,7 @@ Return strict JSON only. Do not return markdown, comments, or extra text.
 Schema:
 {
   "important": true,
+  "unrelated": false,
   "summary": "short Chinese summary",
   "direction": "利好|利空|中性",
   "st": "正面|负面|中性",
@@ -34,13 +35,14 @@ Schema:
 
 Allowed values:
 - important: true, false
+- unrelated: true, false
 - direction: 利好, 利空, 中性
 - st and lt: 正面, 负面, 中性
 - level: 1, 2, 3, 4, 5
 - conf: integer from 0 to 100
 - coins: BTC, ETH, SOL, BNB, NASDAQ, S&P500, DOW, DXY, GOLD, OIL, NVDA, TSLA, AAPL, MSFT, META, GOOGL, AMZN, COIN, MSTR, 美股科技股, 韩股科技股, 半导体, AI, unknown
 - cat: 监管, ETF, 宏观, 安全, 上币, 解锁, 机构, 技术, 生态, 其他
-- news_label: macro_rate_policy, geopolitical_risk, sector_catalyst, earnings_financials, liquidity_drain, crowding_positioning, cross_asset_signal, binary_event_risk, priced_in_or_stale, exchange_platform_risk, regulatory_policy, unknown
+- news_label: macro_rate_policy, earnings_event, geopolitical_risk, sector_catalyst, liquidity_drain, policy_intervention, market_session_signal, crowding_positioning, cross_asset_signal, binary_event_risk, priced_in_or_stale, exchange_platform_risk, regulatory_policy, unknown
 - btc_price, us_tech_stocks, korean_tech_stocks: increase, decrease, neutral, unclear
 - action: long, short, close, add, reduce, wait, rotate, avoid, rule, none
 - bias: bullish, bearish, neutral, wait, mixed, n/a
@@ -51,18 +53,23 @@ Allowed values:
 - gap: none, exact_event_time, fed_funds_probability, etf_flow, earnings_date, policy_details, treaty_terms, source_confirmation, liquidity_size, market_reaction, positioning_data, valuation_data, other
 
 Decision rules:
-1. Mark important=true only when the message can move BTC, crypto majors, US tech stocks, Korean tech stocks, rates, USD, gold, oil, or broad risk appetite.
-2. Most messages are level 1-2. Use level 4-5 only for news that can plausibly move markets sharply.
-3. Use direction for the overall market read. Use st for short-term impact and lt for longer-term impact.
-4. Use coins for directly affected assets, tickers, indexes, or sectors. Use unknown only when no listed item fits.
-5. Use cat for the page-level category and news_label for the more detailed catalyst type.
-6. news_point must state the factual catalyst. news_implication must state the likely market consequence.
-7. If the message is risk-off for US tech stocks, BTC usually also decreases unless there is a clear crypto-specific reason.
-8. action should match the Dabing trading style: trade only with a clear edge; use wait or avoid for noisy, stale, or binary-event news.
-9. Set priced_in=true when the message is old, widely expected, or already reflected in price.
-10. Set binary_event_risk=true for CPI, FOMC, earnings, war/peace announcements, lawsuits, approvals, listings, or any catalyst where outcome is uncertain and one headline can reverse the trade.
-11. gap must choose the missing data needed to trust the implication. Use none only when no extra data is needed.
-12. For unimportant messages, set important=false, direction="中性", st="中性", lt="中性", level=1, action="none", bias="n/a", conf<=50, and use neutral or unclear for price fields.
+1. Mark unrelated=true when the message has little or no connection to BTC, crypto majors, US tech stocks, Korean tech stocks, rates, USD, gold, oil, or broad risk appetite. Do not retry unrelated messages; return valid JSON with unrelated=true and important=false.
+2. Mark important=true only when the message can move BTC, crypto majors, US tech stocks, Korean tech stocks, rates, USD, gold, oil, or broad risk appetite.
+3. Most messages are level 1-2. Use level 4-5 only for news that can plausibly move markets sharply.
+4. Use direction for the overall market read. Use st for short-term impact and lt for longer-term impact.
+5. Use coins for directly affected assets, tickers, indexes, or sectors. Use unknown only when no listed item fits.
+6. Use cat for the page-level category and news_label for the more detailed catalyst type.
+7. news_point must state the factual catalyst. news_implication must state the likely market consequence.
+8. If the message is risk-off for US tech stocks, BTC usually also decreases unless there is a clear crypto-specific reason.
+9. action should match the Dabing trading style: trade only with a clear edge; use wait or avoid for noisy, stale, or binary-event news.
+10. Set priced_in=true when the message is old, widely expected, or already reflected in price.
+11. Set binary_event_risk=true for CPI, FOMC, earnings, war/peace announcements, lawsuits, approvals, listings, or any catalyst where outcome is uncertain and one headline can reverse the trade.
+12. gap must choose the missing data needed to trust the implication. Use none only when no extra data is needed.
+13. For unimportant or unrelated messages, set important=false, direction="中性", st="中性", lt="中性", level=1, action="none", bias="n/a", conf<=50, and use neutral or unclear for price fields.
+14. Use earnings_event for earnings, guidance, sales, revenue, or company report catalysts.
+15. Use policy_intervention for Fed/government/Trump rescue, jawboning, suppression, or direct policy support/threats.
+16. Use market_session_signal for premarket/open/close behavior, gap-up-then-fade, weekend/session timing, or trading-window signals.
+17. Do not overrate ordinary data. CPI/FOMC/FedWatch/rate-odds changes can alter the thesis; unemployment/nonfarm/GDP data is lower impact unless it changes rate expectations, liquidity, sector cycle, or broad risk appetite.
 
 Message:
 <<<
