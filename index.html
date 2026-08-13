@@ -582,7 +582,7 @@ html[data-theme="light"] .pbtn{background:#dcecf4;color:#24536b;border-color:#76
 <div class="modal" id="calendarModal">
   <div class="mhead">宏观事件日历 <span class="side-panel-code" style="margin-left:8px">MACRO CALENDAR</span><span class="spacer"></span><button class="dclose" onclick="closeAll()">✕</button></div>
   <div class="msec">
-    <p class="note">已预填 2026 年官方日程(FOMC 决议 / 美国 CPI / 非农),时间已换算为你的本地时区。可自行增删。</p>
+    <p class="note">事件来自本地 YAML 日历,proxy.py 启动时会尝试在线刷新 FOMC / 美国 CPI / 非农时间。显示时间已换算为你的本地时区。</p>
     <div id="evList"></div>
     <div class="frow" style="margin-top:12px">
       <input type="text" id="evName" placeholder="事件名称" style="flex:1">
@@ -982,29 +982,14 @@ function showAlert(it){
 }
 
 /* ================= 宏观日历 ================= */
-const DEF_EVENTS=[
-  {n:'美国6月CPI',t:Date.UTC(2026,6,14,12,30)},{n:'FOMC 利率决议',t:Date.UTC(2026,6,29,18,0)},
-  {n:'非农就业(7月)',t:Date.UTC(2026,7,7,12,30)},{n:'美国7月CPI',t:Date.UTC(2026,7,12,12,30)},
-  {n:'非农就业(8月)',t:Date.UTC(2026,8,4,12,30)},{n:'美国8月CPI',t:Date.UTC(2026,8,11,12,30)},
-  {n:'FOMC 利率决议',t:Date.UTC(2026,8,16,18,0)},{n:'非农就业(9月)',t:Date.UTC(2026,9,2,12,30)},
-  {n:'美国9月CPI',t:Date.UTC(2026,9,14,12,30)},{n:'FOMC 利率决议',t:Date.UTC(2026,9,28,18,0)},
-  {n:'非农就业(10月)',t:Date.UTC(2026,10,6,13,30)},{n:'美国10月CPI',t:Date.UTC(2026,10,10,13,30)},
-  {n:'非农就业(11月)',t:Date.UTC(2026,11,4,13,30)},{n:'FOMC 利率决议',t:Date.UTC(2026,11,9,19,0)},
-  {n:'美国11月CPI',t:Date.UTC(2026,11,10,13,30)}
-];
+const DEF_EVENTS=[];
 function loadEv(){try{const v=JSON.parse(localStorage.getItem(STORAGE_KEYS.events));if(Array.isArray(v))return v}catch(e){}
   localStorage.setItem(STORAGE_KEYS.events,JSON.stringify(DEF_EVENTS));return DEF_EVENTS.slice()}
 function saveEv(v){localStorage.setItem(STORAGE_KEYS.events,JSON.stringify(v))}
 async function loadFinanceEvents(){
   try{
     const r=await fetch('/calendar-events'),rows=await r.json();
-    if(!Array.isArray(rows)||!rows.length)return;
-    const evs=loadEv(),seen=new Set(evs.map(e=>`${e.n}|${e.t}`));
-    for(const e of rows){
-      if(e&&e.n&&Number.isFinite(+e.t)&&!seen.has(`${e.n}|${+e.t}`)){
-        evs.push({n:String(e.n),t:+e.t});seen.add(`${e.n}|${+e.t}`);
-      }
-    }
+    const evs=Array.isArray(rows)?rows.filter(e=>e&&e.n&&Number.isFinite(+e.t)).map(e=>({n:String(e.n),t:+e.t})):[];
     saveEv(evs);tickNextEvt();
   }catch(e){}
 }
@@ -1017,9 +1002,7 @@ function renderEvList(){
     const past=e.t<Date.now();
     return`<div class="evrow"><span class="cd ${past?'past':''}">${past?'已过':cdStr(e.t)}</span>
       <span class="nm">${esc(e.n)}</span><span class="mini">${fmtT(e.t)}</span>
-      <span class="del" data-i="${i}" title="删除">✕</span></div>`}).join('')||'<p class="note">暂无事件</p>';
-  document.querySelectorAll('#evList .del').forEach(el=>el.onclick=()=>{
-    const evs2=loadEv().sort((a,b)=>a.t-b.t);evs2.splice(+el.dataset.i,1);saveEv(evs2);renderEvList();tickNextEvt()});
+      <span></span></div>`}).join('')||'<p class="note">暂无事件</p>';
 }
 function tickNextEvt(){
   const evs=loadEv().filter(e=>e.t>Date.now()).sort((a,b)=>a.t-b.t);
@@ -1115,12 +1098,8 @@ function init(){
   $('#btnTheme').onclick=()=>{S.theme=S.theme==='light'?'dark':'light';saveS();applyTheme()};
   $('#fLevel').onchange=applyFilters;$('#fDir').onchange=applyFilters;
   $('#fKw').oninput=()=>applyFilters();
-  $('#btnAddEv').onclick=()=>{
-    const n=$('#evName').value.trim(),t=$('#evTime').value;
-    if(!n||!t)return;
-    const evs=loadEv();evs.push({n,t:new Date(t).getTime()});saveEv(evs);
-    $('#evName').value='';renderEvList();tickNextEvt();};
-  tickNextEvt();loadFinanceEvents();setInterval(tickNextEvt,30000);
+  $('#btnAddEv').disabled=true;
+  loadFinanceEvents().then(tickNextEvt);setInterval(tickNextEvt,30000);
   pollAll();restartPoll();
 }
 window.addEventListener('DOMContentLoaded',init);

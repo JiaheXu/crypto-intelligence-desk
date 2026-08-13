@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import tempfile
 import unittest
@@ -11,7 +13,12 @@ class FinanceCalendarTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "finance_calendar.yaml"
             path.write_text(
-                """company_finance_reports:
+                """macro_events:
+  - name: 美国CPI
+    label: macro_rate_policy
+    time_utc: 2026-08-12T12:30:00Z
+    affects: [BTC, QQQ]
+company_finance_reports:
   - symbol: AAPL
     name: Apple 财报
     time_utc: 2026-08-01T20:00:00Z
@@ -24,8 +31,80 @@ class FinanceCalendarTests(unittest.TestCase):
 
             self.assertEqual(
                 proxy.load_finance_calendar_events(path),
-                [{"n": "Apple 财报", "t": 1785614400000}],
+                [
+                    {"n": "美国CPI", "t": 1786537800000},
+                    {"n": "Apple 财报", "t": 1785614400000},
+                ],
             )
+
+    def test_refresh_finance_calendar_writes_macro_events_and_keeps_earnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "finance_calendar.yaml"
+            path.write_text(
+                """company_finance_reports:
+  - symbol: NVDA
+    name: Nvidia 财报
+    time_utc: 2026-08-26T20:00:00Z
+""",
+                encoding="utf-8",
+            )
+            old_file = proxy.FINANCE_CALENDAR_FILE
+            old_auto = proxy.FINANCE_CALENDAR_AUTO_UPDATE
+            old_bls = proxy._fetch_bls_macro_events
+            old_fomc = proxy._fetch_fomc_macro_events
+            old_nyfed = proxy._fetch_nyfed_macro_events
+            try:
+                proxy.FINANCE_CALENDAR_FILE = path
+                proxy.FINANCE_CALENDAR_AUTO_UPDATE = True
+                proxy._fetch_bls_macro_events = lambda: []
+                proxy._fetch_nyfed_macro_events = lambda: [
+                    {"name": "美国CPI", "label": "macro_rate_policy", "time_utc": "2026-08-12T12:30:00Z", "affects": ["BTC", "QQQ"]}
+                ]
+                proxy._fetch_fomc_macro_events = lambda: [
+                    {"name": "FOMC 利率决议", "label": "macro_rate_policy", "time_utc": "2026-09-16T18:00:00Z", "affects": ["BTC", "QQQ"]}
+                ]
+
+                proxy.refresh_finance_calendar_on_startup()
+
+                text = path.read_text(encoding="utf-8")
+                self.assertIn("macro_events:", text)
+                self.assertIn("美国CPI", text)
+                self.assertIn("FOMC 利率决议", text)
+                self.assertIn("Nvidia 财报", text)
+            finally:
+                proxy.FINANCE_CALENDAR_FILE = old_file
+                proxy.FINANCE_CALENDAR_AUTO_UPDATE = old_auto
+                proxy._fetch_bls_macro_events = old_bls
+                proxy._fetch_fomc_macro_events = old_fomc
+                proxy._fetch_nyfed_macro_events = old_nyfed
+
+    def test_refresh_finance_calendar_uses_nyfed_before_bls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "finance_calendar.yaml"
+            path.write_text("company_finance_reports:\n", encoding="utf-8")
+            old_file = proxy.FINANCE_CALENDAR_FILE
+            old_auto = proxy.FINANCE_CALENDAR_AUTO_UPDATE
+            old_bls = proxy._fetch_bls_macro_events
+            old_fomc = proxy._fetch_fomc_macro_events
+            old_nyfed = proxy._fetch_nyfed_macro_events
+            try:
+                proxy.FINANCE_CALENDAR_FILE = path
+                proxy.FINANCE_CALENDAR_AUTO_UPDATE = True
+                proxy._fetch_fomc_macro_events = lambda: []
+                proxy._fetch_nyfed_macro_events = lambda: [
+                    {"name": "非农就业", "label": "macro_rate_policy", "time_utc": "2026-09-04T12:30:00Z", "affects": ["BTC", "QQQ"]}
+                ]
+                proxy._fetch_bls_macro_events = lambda: (_ for _ in ()).throw(AssertionError("BLS should not be called"))
+
+                proxy.refresh_finance_calendar_on_startup()
+
+                self.assertIn("非农就业", path.read_text(encoding="utf-8"))
+            finally:
+                proxy.FINANCE_CALENDAR_FILE = old_file
+                proxy.FINANCE_CALENDAR_AUTO_UPDATE = old_auto
+                proxy._fetch_bls_macro_events = old_bls
+                proxy._fetch_fomc_macro_events = old_fomc
+                proxy._fetch_nyfed_macro_events = old_nyfed
 
     def test_telegram_finance_news_builds_receiver_warning_packet(self):
         record = proxy.telegram_finance_news_record(
@@ -51,6 +130,40 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertEqual(packet["price_direction"], "increase")
         self.assertIn("BTC:increase | 美股:increase | 韩股:increase", packet["message"])
 
+    def test_telegram_finance_news_record_drops_packet_fields_from_ai_result(self):
+        record = proxy.telegram_finance_news_record(
+            {
+                "important": True,
+                "summary": "美联储暗示降息",
+                "type": "warning_message",
+                "warning_id": "model-owned",
+                "trader_name": "model",
+            },
+            chat_name="tradfi",
+            msg_id=123,
+            text="Fed cuts rates",
+            timestamp="2026-07-07 14:00:00",
+        )
+
+        self.assertEqual(record["summary"], "美联储暗示降息")
+        self.assertNotIn("type", record)
+        self.assertNotIn("warning_id", record)
+        self.assertNotIn("trader_name", record)
+
+    def test_finance_ai_json_drops_packet_fields(self):
+        result = proxy._ai_json('{"important":true,"summary":"ok","type":"warning_message","warning_id":"model-owned"}')
+
+        self.assertEqual(result, {"important": True, "summary": "ok"})
+
+    def test_finance_ai_text_fallback_builds_record_fields(self):
+        result = proxy._ai_json("美联储释放降息信号，利好风险资产和 BTC。")
+
+        self.assertEqual(result["summary"], "美联储释放降息信号，利好风险资产和 BTC。")
+        self.assertTrue(result["important"])
+        self.assertFalse(result["unrelated"])
+        self.assertEqual(result["coins"], ["BTC"])
+        self.assertEqual(result["btc_price"], "increase")
+
     def test_telegram_finance_news_record_marks_unrelated_messages(self):
         record = proxy.telegram_finance_news_record(
             {"important": False, "unrelated": True, "summary": "无关消息"},
@@ -62,13 +175,27 @@ class FinanceCalendarTests(unittest.TestCase):
 
         self.assertTrue(record["unrelated"])
 
+    def test_telegram_finance_news_record_keeps_raw_text_for_dabing(self):
+        record = proxy.telegram_finance_news_record(
+            {"important": True, "unrelated": False, "summary": "降息", "reason": "macro"},
+            chat_name="tradfi",
+            msg_id=125,
+            text="Fed cuts rates",
+            timestamp="2026-07-07 14:02:00",
+        )
+
+        self.assertEqual(record["raw_text"], "Fed cuts rates")
+        self.assertEqual(record["reason"], "macro")
+
     def test_udp_telegram_finance_news_is_stored_and_processed(self):
         sent = []
         original_ai = proxy._post_finance_ai
         original_send = proxy._send_receiver_packet
         original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
         try:
             proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
             proxy._post_finance_ai = lambda _text: {
                 "important": True,
                 "summary": "美联储暗示降息",
@@ -94,6 +221,8 @@ class FinanceCalendarTests(unittest.TestCase):
             proxy._post_finance_ai = original_ai
             proxy._send_receiver_packet = original_send
             proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
 
         self.assertTrue(result["sent"])
         self.assertEqual(sent[0]["warning_type"], "market_news")
@@ -101,6 +230,83 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertEqual(feed[0]["timestamp"], "2026-07-07 14:00:00")
         self.assertEqual(feed[0]["title"], "Fed cuts rates")
         self.assertEqual(feed[0]["body"], "Fed cuts rates")
+
+    def test_telegram_finance_news_logs_receive_and_ai_parse_success_without_details(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy._post_finance_ai = lambda _text: {
+                "important": True,
+                "summary": "美联储暗示降息",
+                "btc_price": "increase",
+            }
+            proxy._send_receiver_packet = lambda _packet: None
+            out = io.StringIO()
+
+            with contextlib.redirect_stdout(out):
+                proxy.ingest_telegram_finance_packet(
+                    {
+                        "type": "telegram_finance_news",
+                        "source": "telegram",
+                        "chat_name": "tradfi",
+                        "msg_id": 123,
+                        "text": "Fed cuts rates",
+                        "timestamp": "2026-07-07 14:00:00",
+                    }
+                )
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+
+        logs = out.getvalue()
+        self.assertIn("[proxy] telegram finance msg received source=telegram chat=tradfi msg_id=123 text_len=14", logs)
+        self.assertIn("[proxy] AI parsed telegram finance msg source=telegram chat=tradfi msg_id=123", logs)
+        self.assertNotIn("Fed cuts rates", logs)
+        self.assertNotIn("美联储暗示降息", logs)
+
+    def test_duplicate_telegram_finance_packet_skips_ai(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        calls = []
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy._post_finance_ai = lambda text: calls.append(text) or {
+                "important": True,
+                "summary": "美联储暗示降息",
+                "btc_price": "increase",
+            }
+            proxy._send_receiver_packet = lambda _packet: None
+            payload = {
+                "type": "telegram_finance_news",
+                "source": "telegram",
+                "chat_name": "tradfi",
+                "msg_id": 123,
+                "text": "Fed cuts rates",
+                "timestamp": "2026-07-07 14:00:00",
+            }
+
+            first = proxy.ingest_telegram_finance_packet(dict(payload))
+            second = proxy.ingest_telegram_finance_packet(dict(payload))
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(first["sent"])
+        self.assertEqual(second, first)
 
     def test_udp_discord_finance_news_is_stored_and_processed(self):
         original_ai = proxy._post_finance_ai
@@ -131,6 +337,40 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(feed[0]["src"], "Guild#macro")
         self.assertEqual(feed[0]["body"], "Discord macro update")
+
+    def test_important_person_name_forces_important_finance_news(self):
+        sent = []
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy._post_finance_ai = lambda _text: {
+                "important": False,
+                "summary": "Trump comments on Nvidia exports",
+                "btc_price": "decrease",
+                "us_tech_stocks": "decrease",
+            }
+            proxy._send_receiver_packet = sent.append
+
+            result = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "tradfi",
+                    "msg_id": 789,
+                    "text": "Trump comments on Nvidia exports",
+                    "timestamp": "2026-07-07 16:00:00",
+                }
+            )
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+
+        self.assertTrue(result["important"])
+        self.assertTrue(result["sent"])
+        self.assertEqual(sent[0]["warning_type"], "market_news")
 
     def test_telegram_finance_news_archives_one_jsonl_file_per_day(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,8 +432,8 @@ class FinanceCalendarTests(unittest.TestCase):
         self.assertEqual(rows[0]["chat_name"], "tradfi")
         self.assertEqual(rows[0]["msg_id"], 123)
         self.assertEqual(rows[0]["text"], "Fed cuts rates")
-        self.assertEqual(rows[0]["ai"]["news_label"], ["macro_rate_policy"])
-        self.assertEqual(rows[0]["ai"]["btc_price"], "increase")
+        self.assertEqual(rows[0]["ai"]["raw_text"], "Fed cuts rates")
+        self.assertTrue(rows[0]["ai"]["important"])
 
     def test_loads_recent_telegram_finance_archive_into_feed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -337,11 +577,15 @@ class FinanceCalendarTests(unittest.TestCase):
 
         self.assertEqual(proxy.TELEGRAM_FINANCE_PROMPT, path.read_text(encoding="utf-8").strip())
 
-    def test_telegram_finance_prompt_uses_unified_non_duplicated_info_schema(self):
+    def test_telegram_finance_prompt_filters_only_and_saves_full_parse_prompt(self):
         root = Path(__file__).resolve().parents[1]
         prompt = (root / "prompts" / "telegram_finance_prompt.txt").read_text(encoding="utf-8")
+        full_prompt = (root / "prompts" / "telegram_finance_prompt.full_parse.txt").read_text(encoding="utf-8")
 
-        for field in (
+        for field in ('"important"', '"unrelated"', '"summary"', '"reason"'):
+            self.assertIn(field, prompt)
+
+        for old_field in (
             '"unrelated"',
             '"direction"',
             '"st"',
@@ -363,17 +607,11 @@ class FinanceCalendarTests(unittest.TestCase):
             '"why"',
             '"reverse"',
         ):
-            self.assertIn(field, prompt)
+            self.assertIn(old_field, full_prompt)
 
-        for duplicate in ('"symbols"', '"markets"', '"cross_asset_effect"', '"trading_action"'):
-            self.assertNotIn(duplicate, prompt)
-
+        self.assertNotIn('"news_implication"', prompt)
         self.assertIn("Do not retry", prompt)
-        self.assertIn("earnings_event", prompt)
-        self.assertIn("policy_intervention", prompt)
-        self.assertIn("market_session_signal", prompt)
-        self.assertIn("FedWatch/rate-odds", prompt)
-        self.assertNotIn("earnings_financials", prompt)
+        self.assertIn("raw message", prompt)
 
 
 if __name__ == "__main__":

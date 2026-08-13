@@ -26,6 +26,7 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:
     PORT = int(os.environ.get("CID_PORT", "8899"))
@@ -35,7 +36,15 @@ except ValueError:
     print("[错误] CID_PORT 必须是 1024 到 65535 之间的整数。")
     sys.exit(2)
 BASE = os.path.dirname(os.path.abspath(__file__))
-FINANCE_CALENDAR_FILE = Path(os.environ.get("FINANCE_CALENDAR_FILE", os.path.join(BASE, "finance_calendar.yaml"))).expanduser()
+FINANCE_CALENDAR_FILE = Path(os.environ.get(
+    "FINANCE_CALENDAR_FILE",
+    os.path.join(BASE, "..", "state", "finance_calendar.yaml"),
+)).expanduser()
+FINANCE_CALENDAR_FALLBACK_FILE = Path(os.path.join(BASE, "finance_calendar.yaml")).expanduser()
+FINANCE_CALENDAR_AUTO_UPDATE = os.environ.get("FINANCE_CALENDAR_AUTO_UPDATE", "1").strip().lower() in {"1", "true", "yes", "on"}
+BLS_ICS_URL = os.environ.get("BLS_CALENDAR_ICS_URL", "https://www.bls.gov/schedule/news_release/bls.ics")
+FOMC_CALENDAR_URL = os.environ.get("FOMC_CALENDAR_URL", "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
+NYFED_CALENDAR_URL_TEMPLATE = os.environ.get("NYFED_CALENDAR_URL_TEMPLATE", "https://www.newyorkfed.org/research/calendars/i-{month}{year}.html")
 TELEGRAM_FINANCE_ARCHIVE_DIR = Path(os.environ.get(
     "TELEGRAM_FINANCE_ARCHIVE_DIR",
     os.path.join(BASE, "..", "state", "telegram_finance_news"),
@@ -86,6 +95,34 @@ TELEGRAM_FINANCE_PROMPT_FILE = Path(os.environ.get(
     os.path.join(BASE, "prompts", "telegram_finance_prompt.txt"),
 )).expanduser()
 TELEGRAM_FINANCE_PROMPT = TELEGRAM_FINANCE_PROMPT_FILE.read_text(encoding="utf-8").strip()
+TELEGRAM_FINANCE_AI_INFO_KEYS = {
+    "important",
+    "unrelated",
+    "summary",
+    "reason",
+    "direction",
+    "st",
+    "lt",
+    "level",
+    "conf",
+    "coins",
+    "cat",
+    "news_label",
+    "news_point",
+    "news_implication",
+    "btc_price",
+    "us_tech_stocks",
+    "korean_tech_stocks",
+    "action",
+    "bias",
+    "reason_tags",
+    "event_timing",
+    "priced_in",
+    "binary_event_risk",
+    "gap",
+    "why",
+    "reverse",
+}
 
 
 class RetryableAIJsonError(ValueError):
@@ -109,16 +146,21 @@ ACW_COOKIES = {}
 TELEGRAM_FINANCE_ITEMS = []
 TELEGRAM_FINANCE_LOCK = threading.Lock()
 TELEGRAM_FINANCE_ARCHIVE_LOCK = threading.Lock()
+TELEGRAM_FINANCE_PROCESSED = {}
+TELEGRAM_FINANCE_PROCESSED_LOCK = threading.Lock()
+IMPORTANT_PERSON_KEYWORDS = ("川普", "特朗普", "trump", "马斯克", "elon musk", "musk", "黄仁勋", "jensen huang")
 
 
 def _yaml_value(value):
     value = value.strip()
+    if value.startswith("[") and value.endswith("]"):
+        return [part.strip().strip("'\"") for part in value[1:-1].split(",") if part.strip()]
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
 
 
-def _company_finance_rows(text):
+def _calendar_section_rows(text, section):
     rows = []
     current = None
     in_section = False
@@ -126,7 +168,7 @@ def _company_finance_rows(text):
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
-        if line.startswith("company_finance_reports:"):
+        if line.startswith(f"{section}:"):
             in_section = True
             continue
         if not in_section:
@@ -152,6 +194,14 @@ def _company_finance_rows(text):
     return rows
 
 
+def _company_finance_rows(text):
+    return _calendar_section_rows(text, "company_finance_reports")
+
+
+def _macro_event_rows(text):
+    return _calendar_section_rows(text, "macro_events")
+
+
 def _parse_utc_ms(value):
     if value is None:
         return 0
@@ -171,12 +221,17 @@ def _parse_utc_ms(value):
 
 def load_finance_calendar_events(path=FINANCE_CALENDAR_FILE):
     try:
-        rows = _company_finance_rows(Path(path).read_text(encoding="utf-8"))
+        calendar_path = Path(path)
+        text = calendar_path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return []
+        if Path(path) == FINANCE_CALENDAR_FILE and FINANCE_CALENDAR_FALLBACK_FILE.exists():
+            text = FINANCE_CALENDAR_FALLBACK_FILE.read_text(encoding="utf-8")
+        else:
+            return []
     except OSError as exc:
         print(f"[proxy] failed to load finance calendar: {exc}")
         return []
+    rows = _macro_event_rows(text) + _company_finance_rows(text)
     events = []
     for row in rows:
         symbol = str(row.get("symbol") or "").strip().upper()
@@ -187,10 +242,230 @@ def load_finance_calendar_events(path=FINANCE_CALENDAR_FILE):
     return events
 
 
+def _calendar_config_text() -> str:
+    try:
+        return FINANCE_CALENDAR_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return FINANCE_CALENDAR_FALLBACK_FILE.read_text(encoding="utf-8") if FINANCE_CALENDAR_FALLBACK_FILE.exists() else ""
+
+
+def _format_yaml_value(value):
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    if re.search(r"[:#\n\r]", text):
+        return json.dumps(text, ensure_ascii=False)
+    return text
+
+
+def _write_finance_calendar(macro_rows, company_rows):
+    FINANCE_CALENDAR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["macro_events:"]
+    for row in sorted(macro_rows, key=lambda item: str(item.get("time_utc") or "")):
+        lines.append(f"  - name: {_format_yaml_value(row.get('name'))}")
+        lines.append(f"    label: {_format_yaml_value(row.get('label'))}")
+        lines.append(f"    time_utc: {_format_yaml_value(row.get('time_utc'))}")
+        affects = row.get("affects")
+        if isinstance(affects, list) and affects:
+            lines.append("    affects: [" + ", ".join(str(item) for item in affects) + "]")
+    lines.append("")
+    lines.append("company_finance_reports:")
+    for row in company_rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        lines.append(f"  - symbol: {symbol}")
+        lines.append(f"    name: {_format_yaml_value(row.get('name') or symbol + ' 财报')}")
+        lines.append(f"    time_utc: {_format_yaml_value(row.get('time_utc'))}")
+    FINANCE_CALENDAR_FILE.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def _fetch_text(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(2_000_000)
+    return raw.decode("utf-8", errors="replace")
+
+
+def _unfold_ics(text):
+    rows = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if line.startswith((" ", "\t")) and rows:
+            rows[-1] += line[1:]
+        else:
+            rows.append(line.rstrip("\r"))
+    return rows
+
+
+def _parse_ics_dt(value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    try:
+        if value.endswith("Z"):
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        elif "T" in value:
+            dt = datetime.strptime(value, "%Y%m%dT%H%M%S").replace(tzinfo=ZoneInfo("America/New_York"))
+        else:
+            dt = datetime.strptime(value, "%Y%m%d").replace(hour=8, minute=30, tzinfo=ZoneInfo("America/New_York"))
+    except ValueError:
+        return ""
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _fetch_bls_macro_events():
+    text = _fetch_text(BLS_ICS_URL)
+    events = []
+    current = {}
+    for line in _unfold_ics(text):
+        if line == "BEGIN:VEVENT":
+            current = {}
+        elif line == "END:VEVENT":
+            summary = str(current.get("SUMMARY") or "")
+            start = _parse_ics_dt(current.get("DTSTART"))
+            if start and "Consumer Price Index" in summary:
+                events.append({"name": "美国CPI", "label": "macro_rate_policy", "time_utc": start, "affects": ["BTC", "QQQ", "NASDAQ"]})
+            elif start and "Employment Situation" in summary:
+                events.append({"name": "非农就业", "label": "macro_rate_policy", "time_utc": start, "affects": ["BTC", "QQQ", "NASDAQ"]})
+            current = {}
+        elif ":" in line and current is not None:
+            key, value = line.split(":", 1)
+            current[key.split(";", 1)[0]] = value
+    return events
+
+
+def _month_window(start, months):
+    year = start.year
+    month = start.month
+    for _ in range(months):
+        yield year, month
+        month += 1
+        if month > 12:
+            year += 1
+            month = 1
+
+
+def _nyfed_event_utc(year, month, day, hhmm):
+    try:
+        hour, minute = [int(part) for part in str(hhmm).split(":", 1)]
+        dt = datetime(int(year), int(month), int(day), hour, minute, tzinfo=ZoneInfo("America/New_York"))
+    except Exception:
+        return ""
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _fetch_nyfed_macro_events():
+    month_names = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    events = []
+    for year, month in _month_window(datetime.now(timezone.utc), 18):
+        url = NYFED_CALENDAR_URL_TEMPLATE.format(month=month_names[month - 1], year=str(year)[-2:])
+        try:
+            text = _fetch_text(url)
+        except Exception:
+            continue
+        for cell in re.findall(r"<div>\s*(\d{1,2})\s*<br/>(.*?)</div>", text, flags=re.S):
+            day, body = cell
+            body_text = re.sub(r"<[^>]+>", " ", body)
+            times = re.findall(r"\((\d{2}:\d{2})\)", body_text)
+            if "Consumer Price Index" in body_text:
+                events.append({"name": "美国CPI", "label": "macro_rate_policy", "time_utc": _nyfed_event_utc(year, month, day, times[0] if times else "08:30"), "affects": ["BTC", "QQQ", "NASDAQ"]})
+            if "Employment Situation" in body_text:
+                events.append({"name": "非农就业", "label": "macro_rate_policy", "time_utc": _nyfed_event_utc(year, month, day, times[0] if times else "08:30"), "affects": ["BTC", "QQQ", "NASDAQ"]})
+    return [event for event in events if event.get("time_utc")]
+
+
+def _fomc_decision_utc(year, month_name, date_text):
+    months = {
+        "January": 1, "February": 2, "March": 3, "April": 4,
+        "May": 5, "June": 6, "July": 7, "August": 8,
+        "September": 9, "October": 10, "November": 11, "December": 12,
+    }
+    month = months.get(month_name)
+    days = [int(item) for item in re.findall(r"\d{1,2}", date_text)]
+    if not month or not days:
+        return ""
+    dt = datetime(int(year), month, days[-1], 14, 0, tzinfo=ZoneInfo("America/New_York"))
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _fetch_fomc_macro_events():
+    text = re.sub(r"<[^>]+>", "\n", _fetch_text(FOMC_CALENDAR_URL))
+    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    events = []
+    month_re = re.compile(r"^(January|February|March|April|May|June|July|August|September|October|November|December)$")
+    for idx, line in enumerate(lines):
+        m = re.match(r"^(\d{4}) FOMC Meetings$", line)
+        if not m:
+            continue
+        year = m.group(1)
+        j = idx + 1
+        while j < len(lines) and not re.match(r"^\d{4} FOMC Meetings$", lines[j]):
+            if month_re.match(lines[j]) and j + 1 < len(lines):
+                time_utc = _fomc_decision_utc(year, lines[j], lines[j + 1])
+                if time_utc:
+                    events.append({"name": "FOMC 利率决议", "label": "macro_rate_policy", "time_utc": time_utc, "affects": ["BTC", "QQQ", "NASDAQ"]})
+                    j += 2
+                    continue
+            j += 1
+    return events
+
+
+def _dedupe_calendar_rows(rows):
+    result = {}
+    for row in rows:
+        key = (str(row.get("name") or "").strip(), str(row.get("time_utc") or "").strip())
+        if key[0] and key[1]:
+            result[key] = row
+    return list(result.values())
+
+
+def _active_macro_rows(rows):
+    now_ms = int(time.time() * 1000)
+    low = now_ms - 14 * 86400 * 1000
+    high = now_ms + 540 * 86400 * 1000
+    return [row for row in rows if low <= _parse_utc_ms(row.get("time_utc")) <= high]
+
+
+def refresh_finance_calendar_on_startup():
+    if not FINANCE_CALENDAR_AUTO_UPDATE:
+        return
+    text = _calendar_config_text()
+    company_rows = _company_finance_rows(text)
+    existing_macro = _macro_event_rows(text)
+    fetched = []
+    errors = []
+    try:
+        fetched.extend(_fetch_fomc_macro_events())
+    except Exception as exc:
+        errors.append(str(exc))
+    if not any(row.get("name") in {"美国CPI", "非农就业"} for row in fetched):
+        try:
+            fetched.extend(_fetch_nyfed_macro_events())
+        except Exception as exc:
+            errors.append(str(exc))
+    if not any(row.get("name") in {"美国CPI", "非农就业"} for row in fetched):
+        try:
+            fetched.extend(_fetch_bls_macro_events())
+        except Exception as exc:
+            errors.append(str(exc))
+    macro_rows = _active_macro_rows(_dedupe_calendar_rows(fetched or existing_macro))
+    if macro_rows or company_rows:
+        _write_finance_calendar(macro_rows, company_rows)
+        print(f"[proxy] finance calendar ready: {FINANCE_CALENDAR_FILE} ({len(macro_rows)} macro, {len(company_rows)} company)")
+    if errors:
+        print("[proxy] finance calendar refresh warnings: " + " | ".join(errors))
+
+
 def _json_bool(value):
     if isinstance(value, bool):
         return value
     return str(value or "").strip().lower() in {"1", "true", "yes", "重要", "important"}
+
+
+def _has_important_person_name(text):
+    text = str(text or "").lower()
+    return any(name in text for name in IMPORTANT_PERSON_KEYWORDS)
 
 
 def _direction(value):
@@ -210,17 +485,51 @@ def _string_list(value):
     return [str(item).strip() for item in value if str(item).strip()] if isinstance(value, list) else []
 
 
+def _ai_text_record(text):
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        raise RetryableAIJsonError("AI 未返回内容")
+    summary = re.split(r"(?<=[。.!！？?])\s+", text, maxsplit=1)[0].strip()
+    summary = summary[:160]
+    lower = text.lower()
+    coins = []
+    for coin in ("BTC", "ETH", "SOL", "BNB", "DOGE", "XRP"):
+        if re.search(rf"\b{coin}\b", text, re.IGNORECASE):
+            coins.append(coin)
+    risk_words = ("btc", "crypto", "coin", "fed", "fomc", "rate", "inflation", "cpi", "ppi", "tariff", "trump", "musk", "jensen", "nvda", "nvidia", "hbm", "tesla", "oil", "gold", "美元", "美联储", "降息", "加息", "通胀", "关税", "川普", "特朗普", "马斯克", "黄仁勋", "英伟达", "半导体", "原油", "黄金", "比特币", "以太")
+    positive_words = ("利好", "上涨", "看涨", "降息", "放松", "流动性", "bullish", "positive", "cut")
+    negative_words = ("利空", "下跌", "看跌", "加息", "收紧", "制裁", "战争", "bearish", "negative", "hike")
+    important = any(word in lower or word in text for word in risk_words)
+    unrelated = any(word in lower or word in text for word in ("unrelated", "not market", "无关", "无市场影响"))
+    if not important and not unrelated:
+        raise RetryableAIJsonError("AI 返回的文本不可解析")
+    btc_price = "increase" if any(word in lower or word in text for word in positive_words) else "decrease" if any(word in lower or word in text for word in negative_words) else "unclear"
+    return {
+        "important": important,
+        "unrelated": not important,
+        "summary": summary,
+        "reason": "AI returned prose; converted locally",
+        "cat": "其他",
+        "coins": coins,
+        "btc_price": btc_price,
+        "us_tech_stocks": "unclear",
+        "korean_tech_stocks": "unclear",
+    }
+
+
 def _ai_json(content):
     text = str(content or "").replace("```json", "").replace("```", "").strip()
     start = text.find("{")
     end = text.rfind("}")
     if start < 0 or end <= start:
-        raise RetryableAIJsonError("AI 未返回 JSON")
+        return _ai_text_record(text)
     try:
         result = json.loads(text[start : end + 1])
     except json.JSONDecodeError as exc:
         raise RetryableAIJsonError("AI 返回的 JSON 格式无效") from exc
-    return result if isinstance(result, dict) else {}
+    if not isinstance(result, dict):
+        return {}
+    return {key: value for key, value in result.items() if key in TELEGRAM_FINANCE_AI_INFO_KEYS}
 
 
 def _parse_time_ms(value):
@@ -350,6 +659,27 @@ def telegram_finance_feed_items():
         return [dict(item) for item in TELEGRAM_FINANCE_ITEMS]
 
 
+def _telegram_finance_dedupe_key(payload):
+    source = str(payload.get("source") or "telegram").strip().lower()
+    chat_name = str(payload.get("chat_name") or "Telegram").strip() or "Telegram"
+    msg_id = str(payload.get("msg_id") or "").strip()
+    text = str(payload.get("text") or "").strip()
+    timestamp = str(payload.get("timestamp") or "").strip()
+    return (source, chat_name, msg_id or timestamp, text)
+
+
+def _remember_processed_telegram_finance(key, result):
+    with TELEGRAM_FINANCE_PROCESSED_LOCK:
+        TELEGRAM_FINANCE_PROCESSED[key] = result
+        while len(TELEGRAM_FINANCE_PROCESSED) > 500:
+            TELEGRAM_FINANCE_PROCESSED.pop(next(iter(TELEGRAM_FINANCE_PROCESSED)))
+
+
+def _cached_processed_telegram_finance(key):
+    with TELEGRAM_FINANCE_PROCESSED_LOCK:
+        return TELEGRAM_FINANCE_PROCESSED.get(key)
+
+
 def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
     return {
         "source": "telegram",
@@ -360,6 +690,7 @@ def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
         "important": _json_bool(result.get("important")),
         "unrelated": _json_bool(result.get("unrelated")),
         "summary": str(result.get("summary") or "").strip(),
+        "reason": str(result.get("reason") or "").strip(),
         "direction": str(result.get("direction") or "中性").strip(),
         "st": str(result.get("st") or "中性").strip(),
         "lt": str(result.get("lt") or "中性").strip(),
@@ -436,9 +767,13 @@ def _post_finance_ai(text):
         try:
             with urllib.request.urlopen(req, timeout=FINANCE_AI_TIMEOUT) as resp:
                 data = json.loads(resp.read(MAX_RESPONSE_BODY).decode("utf-8"))
-            return _ai_json(data["choices"][0]["message"]["content"])
+            content = data["choices"][0]["message"]["content"]
+            return _ai_json(content)
         except RetryableAIJsonError as exc:
             last_error = exc
+            snippet = re.sub(r"\s+", " ", str(content if "content" in locals() else ""))[:240]
+            if snippet:
+                print(f"[proxy] AI JSON invalid: {exc}; response={snippet!r}")
             if attempt >= FINANCE_AI_JSON_RETRIES:
                 break
     raise RuntimeError(f"自动重试 {FINANCE_AI_JSON_RETRIES} 次后仍未返回有效 JSON") from last_error
@@ -463,12 +798,17 @@ def process_telegram_finance_news(payload):
     text = str(payload.get("text") or "").strip()
     if not text:
         raise ValueError("text is required")
+    chat_name = str(payload.get("chat_name") or "telegram").strip() or "telegram"
+    msg_id = payload.get("msg_id")
+    print(f"[proxy] telegram finance msg received source={source} chat={chat_name} msg_id={msg_id or '-'} text_len={len(text)}")
     ai_result = _post_finance_ai(text)
-    print(f"[proxy] telegram finance AI result: {json.dumps(ai_result, ensure_ascii=False, separators=(',', ':'))}")
+    print(f"[proxy] AI parsed telegram finance msg source={source} chat={chat_name} msg_id={msg_id or '-'}")
+    if _has_important_person_name(text):
+        ai_result["important"] = True
     record = telegram_finance_news_record(
         ai_result,
-        chat_name=payload.get("chat_name") or "telegram",
-        msg_id=payload.get("msg_id"),
+        chat_name=chat_name,
+        msg_id=msg_id,
         text=text,
         timestamp=payload.get("timestamp") or datetime.utcnow().isoformat(timespec="seconds"),
     )
@@ -482,12 +822,19 @@ def process_telegram_finance_news(payload):
 def ingest_telegram_finance_packet(payload):
     if str(payload.get("type") or "").strip().lower() != "telegram_finance_news":
         raise ValueError("packet type must be telegram_finance_news")
+    dedupe_key = _telegram_finance_dedupe_key(payload)
+    cached = _cached_processed_telegram_finance(dedupe_key)
+    if cached is not None:
+        source, chat_name, msg_id, _text = dedupe_key
+        print(f"[proxy] duplicate telegram finance msg ignored source={source} chat={chat_name} msg_id={msg_id or '-'}")
+        return cached
     _remember_telegram_finance_item(payload)
     try:
         result = process_telegram_finance_news(payload)
     except Exception as exc:
         _archive_telegram_finance_news(payload, error=exc)
         raise
+    _remember_processed_telegram_finance(dedupe_key, result)
     _archive_telegram_finance_news(payload, result=result)
     return result
 
@@ -503,15 +850,7 @@ def _telegram_finance_udp_loop():
             payload = json.loads(data.decode("utf-8"))
             if not isinstance(payload, dict):
                 continue
-            print(
-                f"[proxy] telegram finance received chat={payload.get('chat_name') or '-'} "
-                f"msg_id={payload.get('msg_id') or '-'} text={payload.get('text') or ''}"
-            )
-            result = ingest_telegram_finance_packet(payload)
-            print(
-                f"[proxy] telegram finance msg chat={payload.get('chat_name') or '-'} "
-                f"msg_id={payload.get('msg_id') or '-'} sent={result.get('sent')}"
-            )
+            ingest_telegram_finance_packet(payload)
         except Exception as exc:
             print(f"[proxy] telegram finance UDP failed: {exc}")
 
@@ -798,6 +1137,7 @@ if __name__ == "__main__":
     print("   关闭本窗口即停止服务")
     print("=" * 52)
     try:
+        refresh_finance_calendar_on_startup()
         load_recent_telegram_finance_archive(limit=5)
         threading.Thread(target=_telegram_finance_udp_loop, daemon=True, name="telegram-finance-udp").start()
         ThreadingServer(("127.0.0.1", PORT), Handler).serve_forever()

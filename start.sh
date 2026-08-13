@@ -11,6 +11,27 @@ FINANCE_CALENDAR_FILE=${FINANCE_CALENDAR_FILE:-"$APP_DIR/../state/finance_calend
 export FINANCE_CALENDAR_FILE
 TELEGRAM_FINANCE_ARCHIVE_DIR=${TELEGRAM_FINANCE_ARCHIVE_DIR:-"$APP_DIR/../state/telegram_finance_news"}
 export TELEGRAM_FINANCE_ARCHIVE_DIR
+INFO_PARSER_BACKEND=${INFO_PARSER_BACKEND:-${AI_BACKEND:-local}}
+case "$INFO_PARSER_BACKEND" in
+  deepseek)
+    INFO_PARSER_PROVIDER=${INFO_PARSER_PROVIDER:-deepseek}
+    INFO_PARSER_URL=${INFO_PARSER_URL:-${DEEPSEEK_URL:-https://api.deepseek.com/chat/completions}}
+    INFO_PARSER_API_KEY=${INFO_PARSER_API_KEY:-${DEEPSEEK_API_KEY:-}}
+    INFO_PARSER_MODEL=${INFO_PARSER_MODEL:-${DEEPSEEK_MODEL:-deepseek-v4-pro}}
+    ;;
+  local)
+    CODEX_PROXY_URL=${CODEX_PROXY_URL:-http://127.0.0.1:8787/v1/chat/completions}
+    INFO_PARSER_PROVIDER=${INFO_PARSER_PROVIDER:-openai}
+    INFO_PARSER_URL=${INFO_PARSER_URL:-"$CODEX_PROXY_URL"}
+    INFO_PARSER_API_KEY=${INFO_PARSER_API_KEY:-${CODEX_PROXY_API_KEY:-${OPENAI_API_KEY:-codex-proxy}}}
+    INFO_PARSER_MODEL=${INFO_PARSER_MODEL:-${OPENAI_MODEL:-gpt-5.4}}
+    ;;
+  *)
+    printf '%s\n' "INFO_PARSER_BACKEND must be 'deepseek' or 'local'." >&2
+    exit 1
+    ;;
+esac
+export INFO_PARSER_BACKEND CODEX_PROXY_URL INFO_PARSER_PROVIDER INFO_PARSER_URL INFO_PARSER_API_KEY INFO_PARSER_MODEL
 APP_URL="http://127.0.0.1:$CID_PORT"
 
 if command -v python3 >/dev/null 2>&1; then
@@ -37,5 +58,6 @@ printf '%s\n' "Crypto Intelligence Desk is running at $APP_URL"
 printf '%s\n' "Finance calendar: $FINANCE_CALENDAR_FILE"
 printf '%s\n' "Telegram finance archive: $TELEGRAM_FINANCE_ARCHIVE_DIR"
 printf '%s\n' "Telegram finance UDP: $FINANCE_NEWS_PROXY_UDP_HOST:$FINANCE_NEWS_PROXY_UDP_PORT"
+printf '%s\n' "Finance AI: $INFO_PARSER_BACKEND/$INFO_PARSER_MODEL via $INFO_PARSER_URL"
 printf '%s\n' "Press Ctrl+C to stop."
 exec "$PYTHON" proxy.py
