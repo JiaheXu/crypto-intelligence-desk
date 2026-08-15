@@ -16,6 +16,7 @@ import urllib.parse
 import ssl
 import os
 import re
+import difflib
 import sys
 import time
 import gzip
@@ -49,9 +50,16 @@ TELEGRAM_FINANCE_ARCHIVE_DIR = Path(os.environ.get(
     "TELEGRAM_FINANCE_ARCHIVE_DIR",
     os.path.join(BASE, "..", "state", "telegram_finance_news"),
 )).expanduser()
+TELEGRAM_FINANCE_INCOMING_LOG_DIR = Path(os.environ.get(
+    "TELEGRAM_FINANCE_INCOMING_LOG_DIR",
+    os.path.join(BASE, "..", "state", "telegram_finance_incoming"),
+)).expanduser()
 MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_RESPONSE_BODY = 12 * 1024 * 1024
 TELEGRAM_FINANCE_TTL_MS = 5 * 60 * 1000
+TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD = float(os.environ.get("TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD", "0.90") or 0.90)
+TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS = int(os.environ.get("TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS", "14400") or 14400)
+TELEGRAM_FINANCE_DEDUPE_RECENT_LIMIT = int(os.environ.get("TELEGRAM_FINANCE_DEDUPE_RECENT_LIMIT", "200") or 200)
 TELEGRAM_FINANCE_UDP_HOST = os.environ.get("CID_TELEGRAM_FINANCE_UDP_HOST", "127.0.0.1").strip() or "127.0.0.1"
 TELEGRAM_FINANCE_UDP_PORT = int(os.environ.get("CID_TELEGRAM_FINANCE_UDP_PORT", os.environ.get("FINANCE_NEWS_PROXY_UDP_PORT", "5201")) or 5201)
 RECEIVER_UDP_HOST = os.environ.get("CID_RECEIVER_UDP_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -148,6 +156,7 @@ TELEGRAM_FINANCE_LOCK = threading.Lock()
 TELEGRAM_FINANCE_ARCHIVE_LOCK = threading.Lock()
 TELEGRAM_FINANCE_PROCESSED = {}
 TELEGRAM_FINANCE_PROCESSED_LOCK = threading.Lock()
+TELEGRAM_FINANCE_RECENT_DEDUPE = []
 IMPORTANT_PERSON_KEYWORDS = ("川普", "特朗普", "trump", "马斯克", "elon musk", "musk", "黄仁勋", "jensen huang")
 
 
@@ -580,6 +589,26 @@ def _archive_telegram_finance_news(payload, *, result=None, error=None):
             fh.write(line)
 
 
+def _log_incoming_telegram_finance_news(payload):
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        return
+    record = {
+        "received_at": datetime.now().isoformat(timespec="seconds"),
+        "timestamp": str(payload.get("timestamp") or "").strip(),
+        "source": str(payload.get("source") or "telegram").strip() or "telegram",
+        "chat_name": str(payload.get("chat_name") or "Telegram").strip() or "Telegram",
+        "msg_id": payload.get("msg_id"),
+        "text": text,
+    }
+    path = TELEGRAM_FINANCE_INCOMING_LOG_DIR / f"{_archive_day(record['timestamp'])}.jsonl"
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    with TELEGRAM_FINANCE_ARCHIVE_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+
+
 def _remember_telegram_finance_item(payload):
     text = str(payload.get("text") or "").strip()
     chat_name = str(payload.get("chat_name") or "Telegram").strip() or "Telegram"
@@ -659,13 +688,28 @@ def telegram_finance_feed_items():
         return [dict(item) for item in TELEGRAM_FINANCE_ITEMS]
 
 
+def _normalize_telegram_finance_text(text):
+    text = str(text or "").lower()
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"@[\w_]+", " ", text)
+    text = re.sub(r"\brt\b", " ", text)
+    text = re.sub(r"免费助力|注册币安|claude/gpt/grok/glm|全球顶级ai中转站|章鱼哥新闻流|octosignal", " ", text)
+    text = re.sub(r"[^\w\u4e00-\u9fff.%+-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _telegram_finance_number_tokens(text):
+    return tuple(
+        re.findall(
+            r"(?<!\w)[+-]?\d+(?:\.\d+)?\s*(?:%|bp|bps|亿美元|万亿|亿|万|美元|usdt|btc|eth)?",
+            str(text or "").lower(),
+        )
+    )
+
+
 def _telegram_finance_dedupe_key(payload):
-    source = str(payload.get("source") or "telegram").strip().lower()
-    chat_name = str(payload.get("chat_name") or "Telegram").strip() or "Telegram"
-    msg_id = str(payload.get("msg_id") or "").strip()
     text = str(payload.get("text") or "").strip()
-    timestamp = str(payload.get("timestamp") or "").strip()
-    return (source, chat_name, msg_id or timestamp, text)
+    return ("finance_text", _normalize_telegram_finance_text(text))
 
 
 def _remember_processed_telegram_finance(key, result):
@@ -678,6 +722,52 @@ def _remember_processed_telegram_finance(key, result):
 def _cached_processed_telegram_finance(key):
     with TELEGRAM_FINANCE_PROCESSED_LOCK:
         return TELEGRAM_FINANCE_PROCESSED.get(key)
+
+
+def _cached_similar_telegram_finance(payload):
+    threshold = TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD
+    if threshold <= 0 or threshold > 1:
+        return None
+    text = str(payload.get("text") or "").strip()
+    normalized = _normalize_telegram_finance_text(text)
+    if len(normalized) < 20:
+        return None
+    now_ms = _parse_time_ms(payload.get("timestamp"))
+    window_ms = max(0, TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS) * 1000
+    numbers = _telegram_finance_number_tokens(text)
+    with TELEGRAM_FINANCE_PROCESSED_LOCK:
+        recent = []
+        for item in TELEGRAM_FINANCE_RECENT_DEDUPE:
+            if window_ms and now_ms - item["time"] > window_ms:
+                continue
+            recent.append(item)
+        if len(recent) != len(TELEGRAM_FINANCE_RECENT_DEDUPE):
+            TELEGRAM_FINANCE_RECENT_DEDUPE[:] = recent
+        for item in recent:
+            if numbers != item["numbers"]:
+                continue
+            other = item["normalized"]
+            if abs(len(normalized) - len(other)) / max(len(normalized), len(other)) > 0.55:
+                continue
+            if difflib.SequenceMatcher(None, normalized, other).ratio() >= threshold:
+                return item["result"]
+    return None
+
+
+def _remember_similar_telegram_finance(payload, result):
+    text = str(payload.get("text") or "").strip()
+    normalized = _normalize_telegram_finance_text(text)
+    if len(normalized) < 20:
+        return
+    row = {
+        "time": _parse_time_ms(payload.get("timestamp")),
+        "normalized": normalized,
+        "numbers": _telegram_finance_number_tokens(text),
+        "result": result,
+    }
+    with TELEGRAM_FINANCE_PROCESSED_LOCK:
+        TELEGRAM_FINANCE_RECENT_DEDUPE.insert(0, row)
+        del TELEGRAM_FINANCE_RECENT_DEDUPE[max(1, TELEGRAM_FINANCE_DEDUPE_RECENT_LIMIT):]
 
 
 def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
@@ -822,10 +912,15 @@ def process_telegram_finance_news(payload):
 def ingest_telegram_finance_packet(payload):
     if str(payload.get("type") or "").strip().lower() != "telegram_finance_news":
         raise ValueError("packet type must be telegram_finance_news")
+    _log_incoming_telegram_finance_news(payload)
     dedupe_key = _telegram_finance_dedupe_key(payload)
     cached = _cached_processed_telegram_finance(dedupe_key)
+    if cached is None:
+        cached = _cached_similar_telegram_finance(payload)
     if cached is not None:
-        source, chat_name, msg_id, _text = dedupe_key
+        source = str(payload.get("source") or "telegram").strip().lower()
+        chat_name = str(payload.get("chat_name") or "Telegram").strip() or "Telegram"
+        msg_id = str(payload.get("msg_id") or "").strip()
         print(f"[proxy] duplicate telegram finance msg ignored source={source} chat={chat_name} msg_id={msg_id or '-'}")
         return cached
     _remember_telegram_finance_item(payload)
@@ -835,6 +930,7 @@ def ingest_telegram_finance_packet(payload):
         _archive_telegram_finance_news(payload, error=exc)
         raise
     _remember_processed_telegram_finance(dedupe_key, result)
+    _remember_similar_telegram_finance(payload, result)
     _archive_telegram_finance_news(payload, result=result)
     return result
 

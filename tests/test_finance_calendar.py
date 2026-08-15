@@ -308,6 +308,199 @@ company_finance_reports:
         self.assertTrue(first["sent"])
         self.assertEqual(second, first)
 
+    def test_incoming_telegram_finance_log_keeps_duplicate_packets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            original_ai = proxy._post_finance_ai
+            original_send = proxy._send_receiver_packet
+            original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+            original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+            original_incoming_dir = proxy.TELEGRAM_FINANCE_INCOMING_LOG_DIR
+            try:
+                proxy.TELEGRAM_FINANCE_INCOMING_LOG_DIR = Path(tmp)
+                proxy.TELEGRAM_FINANCE_ITEMS.clear()
+                proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+                if hasattr(proxy, "TELEGRAM_FINANCE_RECENT_DEDUPE"):
+                    proxy.TELEGRAM_FINANCE_RECENT_DEDUPE.clear()
+                proxy._post_finance_ai = lambda _text: {"important": False, "summary": "ok"}
+                proxy._send_receiver_packet = lambda _packet: None
+                payload = {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "tradfi",
+                    "msg_id": 123,
+                    "text": "Fed cuts rates",
+                    "timestamp": "2026-07-07 14:00:00",
+                }
+
+                proxy.ingest_telegram_finance_packet(dict(payload))
+                proxy.ingest_telegram_finance_packet(dict(payload))
+
+                lines = (Path(tmp) / "2026-07-07.jsonl").read_text(encoding="utf-8").splitlines()
+            finally:
+                proxy._post_finance_ai = original_ai
+                proxy._send_receiver_packet = original_send
+                proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+                proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+                proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+                if hasattr(proxy, "TELEGRAM_FINANCE_RECENT_DEDUPE"):
+                    proxy.TELEGRAM_FINANCE_RECENT_DEDUPE.clear()
+                proxy.TELEGRAM_FINANCE_INCOMING_LOG_DIR = original_incoming_dir
+
+        self.assertEqual(len(lines), 2)
+        self.assertEqual([json.loads(line)["text"] for line in lines], ["Fed cuts rates", "Fed cuts rates"])
+
+    def test_duplicate_telegram_finance_text_from_other_channel_skips_ai(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        calls = []
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy._post_finance_ai = lambda text: calls.append(text) or {
+                "important": True,
+                "summary": "美联储暗示降息",
+                "btc_price": "increase",
+            }
+            proxy._send_receiver_packet = lambda _packet: None
+
+            first = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "tradfi-a",
+                    "msg_id": 123,
+                    "text": "Fed cuts rates",
+                    "timestamp": "2026-07-07 14:00:00",
+                }
+            )
+            second = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "tradfi-b",
+                    "msg_id": 456,
+                    "text": "  Fed   cuts rates  ",
+                    "timestamp": "2026-07-07 14:01:00",
+                }
+            )
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second, first)
+
+    def test_similar_telegram_finance_text_over_threshold_skips_ai(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        original_threshold = getattr(proxy, "TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD", None)
+        calls = []
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            if hasattr(proxy, "TELEGRAM_FINANCE_RECENT_DEDUPE"):
+                proxy.TELEGRAM_FINANCE_RECENT_DEDUPE.clear()
+            proxy.TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD = 0.85
+            proxy._post_finance_ai = lambda text: calls.append(text) or {
+                "important": True,
+                "summary": "谷歌AI重组",
+                "btc_price": "increase",
+            }
+            proxy._send_receiver_packet = lambda _packet: None
+
+            first = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "tradfi_cn",
+                    "msg_id": 123,
+                    "text": "消息人士称 谷歌高管讨论人工智能部门重组事宜 $GOOGL",
+                    "timestamp": "2026-08-13 01:33:39",
+                }
+            )
+            second = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "章鱼哥新闻流 OctoSignal",
+                    "msg_id": 402,
+                    "text": "消息人士称 谷歌高管讨论人工智能部门重组事宜 $GOOGL ──────────── 章鱼哥新闻流 · OCTOSIGNAL",
+                    "timestamp": "2026-08-13 01:33:58",
+                }
+            )
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+            if hasattr(proxy, "TELEGRAM_FINANCE_RECENT_DEDUPE"):
+                proxy.TELEGRAM_FINANCE_RECENT_DEDUPE.clear()
+            if original_threshold is not None:
+                proxy.TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD = original_threshold
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second, first)
+
+    def test_similar_telegram_finance_text_with_different_numbers_does_not_skip_ai(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        original_threshold = getattr(proxy, "TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD", None)
+        calls = []
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            if hasattr(proxy, "TELEGRAM_FINANCE_RECENT_DEDUPE"):
+                proxy.TELEGRAM_FINANCE_RECENT_DEDUPE.clear()
+            proxy.TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD = 0.85
+            proxy._post_finance_ai = lambda text: calls.append(text) or {
+                "important": False,
+                "summary": "黄金ETF持仓变化",
+            }
+            proxy._send_receiver_packet = lambda _packet: None
+
+            proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "金十数据 闪电资讯",
+                    "msg_id": 123,
+                    "text": "全球最大黄金ETF持仓较上日增加3.139吨 当前持仓量为1025.811吨",
+                    "timestamp": "2026-08-13 10:00:00",
+                }
+            )
+            proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "金十数据 闪电资讯",
+                    "msg_id": 456,
+                    "text": "全球最大黄金ETF持仓较上日减少2.568吨 当前持仓量为1023.243吨",
+                    "timestamp": "2026-08-13 10:01:00",
+                }
+            )
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+            if hasattr(proxy, "TELEGRAM_FINANCE_RECENT_DEDUPE"):
+                proxy.TELEGRAM_FINANCE_RECENT_DEDUPE.clear()
+            if original_threshold is not None:
+                proxy.TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD = original_threshold
+
+        self.assertEqual(len(calls), 2)
+
     def test_udp_discord_finance_news_is_stored_and_processed(self):
         original_ai = proxy._post_finance_ai
         original_send = proxy._send_receiver_packet
