@@ -1173,9 +1173,12 @@ function retryAI(id){const it=NEWS.get(id);if(!it)return;
 const NEWS_SYS='你是专业的加密行业新闻研究员。任务是识别事实、相关方、时效性与潜在行业影响；必须客观谨慎，宁可降低评级也不夸大，不提供买卖、仓位或价格点位建议，并且只输出一个JSON对象。';
 function newsPrompt(it){
   return `请分析以下币圈快讯对市场的影响,严格输出JSON:
-{"direction":"利好|利空|中性","st":"正面|负面|中性","lt":"正面|负面|中性","level":1到5的整数,"conf":0到100整数,"coins":["受影响币种基础代码(如BTC),最多5个;影响整个行业则填BTC和ETH"],"cat":"监管|ETF|宏观|安全|上币|解锁|机构|技术|生态|其他","priced_in":true或false,"why":"2-3句具体分析,必须给出因果逻辑,不要空话","reverse":"一句话说明可能导致当前解读失效的条件"}
+{"direction":"利好|利空|中性","st":"正面|负面|中性","lt":"正面|负面|中性","level":1到5的整数,"conf":0到100整数,"coins":["受影响币种基础代码(如BTC),最多5个;影响整个行业则填BTC和ETH"],"affected_stocks":["受影响股票/ETF/商品符号,最多8个"],"affected_sectors":["受影响板块/产业链,最多5个"],"positive_affected_stocks":["正面影响股票/ETF/商品符号,最多8个"],"negative_affected_stocks":["负面影响股票/ETF/商品符号,最多8个"],"positive_affected_sectors":["正面影响板块/产业链,最多5个"],"negative_affected_sectors":["负面影响板块/产业链,最多5个"],"cat":"监管|ETF|宏观|安全|上币|解锁|机构|技术|生态|其他","priced_in":true或false,"why":"2-3句具体分析,必须给出因果逻辑,不要空话","reverse":"一句话说明可能导致当前解读失效的条件"}
 字段说明:
 - st=短期(小时/天级)影响, lt=长期(周/月级)影响,两者可以不同
+- affected_stocks: 只填可能被这条新闻显著影响的股票、ETF、指数或商品符号；没有则填空数组
+- affected_sectors: 填受影响板块或产业链,例如AI算力、存储、半导体设备、韩国科技、加密矿工；没有则填空数组
+- positive_affected_* 和 negative_affected_*: 按正面/负面影响拆分；方向不清楚则留空
 - level影响等级: 1=噪音/日常 2=轻微 3=值得关注 4=重大(可能引发行情明显波动) 5=极重大(如FOMC意外决议/顶级交易所暴雷/美国重大监管落地)
 - priced_in: 若属旧闻发酵、符合预期的兑现、或市场大概率已提前反应,填true
 - 绝大多数快讯是1-2级,4级以上必须有充分理由
@@ -1192,6 +1195,7 @@ async function analyzeNews(it){
   a.level=Math.min(5,Math.max(1,Math.round(+a.level||1)));
   a.conf=Math.min(100,Math.max(0,Math.round(+a.conf||50)));
   a.coins=(Array.isArray(a.coins)?a.coins:[]).map(c=>String(c).toUpperCase().replace(/[^A-Z0-9]/g,'')).filter(c=>c&&c.length<=8).slice(0,5);
+  normalizeAffected(a);
   it.ai=a;
   renderAI(it);
   if(a.level>=4){
@@ -1208,8 +1212,20 @@ async function deepAnalyze(it){
   a.level=Math.min(5,Math.max(1,Math.round(+a.level||it.ai.level)));
   a.conf=Math.min(100,Math.max(0,Math.round(+a.conf||it.ai.conf)));
   a.coins=(Array.isArray(a.coins)&&a.coins.length?a.coins:it.ai.coins).map(c=>String(c).toUpperCase().replace(/[^A-Z0-9]/g,'')).slice(0,5);
+  normalizeAffected(a,it.ai);
   a.deep=true;
   it.ai=a;renderAI(it);applyFilters();
+}
+
+function normSymbols(value,limit=8){return(Array.isArray(value)?value:[]).map(c=>String(c).toUpperCase().replace(/[^A-Z0-9]/g,'')).filter(c=>c&&c.length<=12).slice(0,limit)}
+function normLabels(value,limit=5){return(Array.isArray(value)?value:[]).map(c=>String(c).trim()).filter(Boolean).slice(0,limit)}
+function normalizeAffected(a,base={}){
+  a.affected_stocks=normSymbols(a.affected_stocks&&a.affected_stocks.length?a.affected_stocks:base.affected_stocks||[]);
+  a.affected_sectors=normLabels(a.affected_sectors&&a.affected_sectors.length?a.affected_sectors:base.affected_sectors||[]);
+  a.positive_affected_stocks=normSymbols(a.positive_affected_stocks&&a.positive_affected_stocks.length?a.positive_affected_stocks:base.positive_affected_stocks||[]);
+  a.negative_affected_stocks=normSymbols(a.negative_affected_stocks&&a.negative_affected_stocks.length?a.negative_affected_stocks:base.negative_affected_stocks||[]);
+  a.positive_affected_sectors=normLabels(a.positive_affected_sectors&&a.positive_affected_sectors.length?a.positive_affected_sectors:base.positive_affected_sectors||[]);
+  a.negative_affected_sectors=normLabels(a.negative_affected_sectors&&a.negative_affected_sectors.length?a.negative_affected_sectors:base.negative_affected_sectors||[]);
 }
 
 function renderAI(it){
@@ -1221,6 +1237,8 @@ function renderAI(it){
   const dirLabel=a.direction==='利好'?'正面影响':a.direction==='利空'?'负面影响':'中性影响';
   const impact=v=>v==='正面'?`<b class="pos">＋正面</b>`:v==='负面'?`<b class="neg">－负面</b>`:'<b style="color:var(--dim)">中性</b>';
   const lvlCls=a.level>=5?'xhi':a.level>=4?'hi':'';
+  const chip=(items,cls,title)=>items.map(c=>`<span class="${cls}" title="${title}">${esc(c)}</span>`).join('');
+  const impactLine=(label,sectors,stocks,cls)=>sectors.length||stocks.length?`<div class="why ${cls}">${label} ${chip(sectors,'cat '+cls,label) || '<span class="mini">-</span>'}, stocks: ${chip(stocks,'coin '+cls,label) || '<span class="mini">-</span>'}</div>`:'';
   el.innerHTML=`
     <div class="brow">
       <span class="bdg ${dirCls}">${dirLabel}</span>
@@ -1232,6 +1250,8 @@ function renderAI(it){
       ${a.deep?'<span class="deep">深度复核</span>':''}
       ${a.coins.map(c=>`<span class="coin" title="受影响资产">${c}</span>`).join('')}
     </div>
+    ${impactLine('positively affected sector:',a.positive_affected_sectors||[],a.positive_affected_stocks||[],'pos')}
+    ${impactLine('negatively affected sector:',a.negative_affected_sectors||[],a.negative_affected_stocks||[],'neg')}
     <div class="why">${esc(a.why||'')}</div>
     ${a.reverse?`<div class="rev">解读失效条件 · ${esc(a.reverse)}</div>`:''}`;
   sortFeed();updateDashboard();

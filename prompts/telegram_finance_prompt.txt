@@ -10,6 +10,12 @@ Schema:
   "unrelated": false,
   "summary": "short Chinese summary",
   "reason": "why this message is or is not useful for market planning",
+  "affected_stocks": ["ASML"],
+  "affected_sectors": ["semiconductor equipment"],
+  "positive_affected_stocks": ["NVDA"],
+  "negative_affected_stocks": ["SKHYNIX"],
+  "positive_affected_sectors": ["AI infrastructure"],
+  "negative_affected_sectors": ["memory"],
   "cat": "one primary category",
   "news_label": ["short labels"],
   "reason_tags": ["short reason tags"],
@@ -25,17 +31,23 @@ Allowed values:
 - cat: one of 宏观利率, 美国政策, 地缘政治, AI算力, 半导体存储, 半导体设备, 美股科技, 加密市场结构, 财报评级, 流动性资金, 大宗商品能源, 中国港股, 其他
 - btc_price/us_tech_stocks/korean_tech_stocks: increase, decrease, neutral, unclear
 
+Symbol watchlist:
+{symbol_watchlist}
+
 Decision rules:
 1. Mark unrelated=true when the message has little or no connection to BTC, crypto majors, US tech stocks, Korean tech stocks, rates, USD, gold, oil, or broad risk appetite. Do not retry unrelated messages; return unrelated=true and important=false.
 2. Mark important=true only when the raw message is useful context for Dabing's market plan.
 3. Keep summary short. Do not infer trading side, prices, or targets; Dabing will read the raw message directly.
-4. Always classify important people:
+4. Fill affected_stocks only with symbols from the Symbol watchlist that are directly or materially affected by the news. Use [] when none are relevant.
+5. Fill affected_sectors with broad affected sectors or supply-chain areas, for example ["AI infrastructure","memory","semiconductor equipment","Korea tech","crypto miners"]. Use [] when none are relevant.
+6. Split affected symbols and sectors by expected direction into positive_affected_stocks, negative_affected_stocks, positive_affected_sectors, and negative_affected_sectors. Use [] when the side is unclear.
+7. Always classify important people:
    - 川普, 特朗普, Trump: important=true, cat=美国政策 unless the content is mainly war/sanctions/tariffs/Taiwan/Middle East/Russia, then cat=地缘政治.
    - 马斯克, Elon Musk, Musk: important=true, cat=美股科技. Add AI算力 label when xAI, Grok, Tesla AI, robot, Dojo, chip, data center, or model is mentioned. Add 加密市场结构 label when BTC, DOGE, crypto, or coin is mentioned.
    - 黄仁勋, Jensen Huang: important=true, cat=AI算力. Add 美股科技 label. Add 半导体存储 label when HBM, DRAM, NAND, memory, SK Hynix, Micron, or Samsung is mentioned.
-5. Use news_label for all useful secondary categories, for example ["AI算力","半导体存储","美股科技"].
-6. Use reason_tags for compact reasons, for example ["Trump","tariff","HBM","NVDA","BTC ETF","rate expectation"].
-7. Fill coins only for crypto symbols directly mentioned. Do not put stock tickers in coins.
+8. Use news_label for all useful secondary categories, for example ["AI算力","半导体存储","美股科技"].
+9. Use reason_tags for compact reasons, for example ["Trump","tariff","HBM","NVDA","BTC ETF","rate expectation"].
+10. Fill coins only for crypto symbols directly mentioned. Do not put stock tickers in coins.
 
 Message:
 <<<

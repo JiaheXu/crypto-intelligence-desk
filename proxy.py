@@ -42,6 +42,10 @@ FINANCE_CALENDAR_FILE = Path(os.environ.get(
     os.path.join(BASE, "..", "state", "finance_calendar.yaml"),
 )).expanduser()
 FINANCE_CALENDAR_FALLBACK_FILE = Path(os.path.join(BASE, "finance_calendar.yaml")).expanduser()
+SYMBOL_WATCHLIST_FILE = Path(os.environ.get(
+    "SYMBOL_WATCHLIST_FILE",
+    os.path.join(BASE, "symbol_watchlist.yaml"),
+)).expanduser()
 FINANCE_CALENDAR_AUTO_UPDATE = os.environ.get("FINANCE_CALENDAR_AUTO_UPDATE", "1").strip().lower() in {"1", "true", "yes", "on"}
 BLS_ICS_URL = os.environ.get("BLS_CALENDAR_ICS_URL", "https://www.bls.gov/schedule/news_release/bls.ics")
 FOMC_CALENDAR_URL = os.environ.get("FOMC_CALENDAR_URL", "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm")
@@ -108,6 +112,12 @@ TELEGRAM_FINANCE_AI_INFO_KEYS = {
     "unrelated",
     "summary",
     "reason",
+    "affected_stocks",
+    "affected_sectors",
+    "positive_affected_stocks",
+    "negative_affected_stocks",
+    "positive_affected_sectors",
+    "negative_affected_sectors",
     "direction",
     "st",
     "lt",
@@ -135,6 +145,70 @@ TELEGRAM_FINANCE_AI_INFO_KEYS = {
 
 class RetryableAIJsonError(ValueError):
     pass
+
+
+ANSI_RESET = "\033[0m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_BLUE = "\033[34m"
+ANSI_GRAY = "\033[90m"
+
+
+def _ansi(text, color):
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def _ai_level_color(value, *, effect=False, confidence=False):
+    if confidence:
+        try:
+            return ANSI_GREEN if float(value) >= 70 else ANSI_YELLOW if float(value) >= 50 else ANSI_RED
+        except (TypeError, ValueError):
+            return ANSI_GRAY
+    text = str(value or "").strip().lower()
+    if effect:
+        if text in {"increase", "positive", "bullish", "正面", "上涨"}:
+            return ANSI_GREEN
+        if text in {"decrease", "negative", "bearish", "负面", "下跌"}:
+            return ANSI_RED
+        return ANSI_GRAY if text in {"", "neutral", "unclear", "中性"} else ANSI_YELLOW
+    return ANSI_GREEN if bool(value) else ANSI_YELLOW
+
+
+def _ai_parsing_log(ai_result):
+    important = "important" if ai_result.get("important") else "not important"
+    effect = ai_result.get("effect") or ai_result.get("btc_price") or ai_result.get("direction") or "-"
+    confidence = ai_result.get("confidence") if ai_result.get("confidence") is not None else ai_result.get("conf", "-")
+    stocks = _string_list(ai_result.get("affected_stocks"))[:8]
+    sectors = _string_list(ai_result.get("affected_sectors"))[:5]
+    pos_stocks = _string_list(ai_result.get("positive_affected_stocks"))[:8]
+    neg_stocks = _string_list(ai_result.get("negative_affected_stocks"))[:8]
+    pos_sectors = _string_list(ai_result.get("positive_affected_sectors"))[:5]
+    neg_sectors = _string_list(ai_result.get("negative_affected_sectors"))[:5]
+    suffix = ""
+    if stocks:
+        suffix += f" / stocks={','.join(stocks)}"
+    if sectors:
+        suffix += f" / sectors={','.join(sectors)}"
+    if pos_stocks or pos_sectors:
+        suffix += (
+            " / positively affected sector: "
+            f"{_ansi(','.join(pos_sectors) or '-', ANSI_GREEN)}, stocks: "
+            f"{_ansi(','.join(pos_stocks) or '-', ANSI_GREEN)}"
+        )
+    if neg_stocks or neg_sectors:
+        suffix += (
+            " / negatively affected sector: "
+            f"{_ansi(','.join(neg_sectors) or '-', ANSI_RED)}, stocks: "
+            f"{_ansi(','.join(neg_stocks) or '-', ANSI_RED)}"
+        )
+    return (
+        "[proxy] AI parsing: "
+        f"{_ansi(important, _ai_level_color(ai_result.get('important')))} / "
+        f"{_ansi(effect, _ai_level_color(effect, effect=True))} / "
+        f"{_ansi(confidence, _ai_level_color(confidence, confidence=True))}"
+        f"{suffix}"
+    )
 
 # 部分新闻接口要求带来源页,否则返回 403
 REFERERS = {
@@ -209,6 +283,31 @@ def _company_finance_rows(text):
 
 def _macro_event_rows(text):
     return _calendar_section_rows(text, "macro_events")
+
+
+def load_symbol_watchlist(path=SYMBOL_WATCHLIST_FILE):
+    try:
+        text = Path(path).expanduser().read_text(encoding="utf-8")
+    except OSError:
+        return []
+    watchlist = []
+    seen = set()
+    for row in _calendar_section_rows(text, "symbol_watchlist"):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        watchlist.append({"symbol": symbol, "name": str(row.get("name") or symbol).strip()})
+    return watchlist
+
+
+SYMBOL_WATCHLIST = load_symbol_watchlist()
+
+
+def _symbol_watchlist_prompt():
+    if not SYMBOL_WATCHLIST:
+        return "- none"
+    return "\n".join(f"- {row['symbol']}: {row.get('name') or row['symbol']}" for row in SYMBOL_WATCHLIST)
 
 
 def _parse_utc_ms(value):
@@ -781,6 +880,12 @@ def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
         "unrelated": _json_bool(result.get("unrelated")),
         "summary": str(result.get("summary") or "").strip(),
         "reason": str(result.get("reason") or "").strip(),
+        "affected_stocks": _string_list(result.get("affected_stocks")),
+        "affected_sectors": _string_list(result.get("affected_sectors")),
+        "positive_affected_stocks": _string_list(result.get("positive_affected_stocks")),
+        "negative_affected_stocks": _string_list(result.get("negative_affected_stocks")),
+        "positive_affected_sectors": _string_list(result.get("positive_affected_sectors")),
+        "negative_affected_sectors": _string_list(result.get("negative_affected_sectors")),
         "direction": str(result.get("direction") or "中性").strip(),
         "st": str(result.get("st") or "中性").strip(),
         "lt": str(result.get("lt") or "中性").strip(),
@@ -840,7 +945,7 @@ def _post_finance_ai(text):
         "max_tokens": 600,
         "messages": [
             {"role": "system", "content": "You classify Telegram finance news impact for BTC and US/Korean tech stocks."},
-            {"role": "user", "content": TELEGRAM_FINANCE_PROMPT.replace("{message}", str(text or ""))},
+            {"role": "user", "content": TELEGRAM_FINANCE_PROMPT.replace("{symbol_watchlist}", _symbol_watchlist_prompt()).replace("{message}", str(text or ""))},
         ],
     }
     req = urllib.request.Request(
@@ -890,9 +995,11 @@ def process_telegram_finance_news(payload):
         raise ValueError("text is required")
     chat_name = str(payload.get("chat_name") or "telegram").strip() or "telegram"
     msg_id = payload.get("msg_id")
-    print(f"[proxy] telegram finance msg received source={source} chat={chat_name} msg_id={msg_id or '-'} text_len={len(text)}")
+    print(f"[proxy] 1 msg from {_ansi(source, ANSI_GREEN)} chat={_ansi(chat_name, ANSI_BLUE)}")
+    raw_snippet = re.sub(r"\s+", " ", text)[:30]
+    print(f"[proxy] raw text: {raw_snippet}")
     ai_result = _post_finance_ai(text)
-    print(f"[proxy] AI parsed telegram finance msg source={source} chat={chat_name} msg_id={msg_id or '-'}")
+    print(_ai_parsing_log(ai_result))
     if _has_important_person_name(text):
         ai_result["important"] = True
     record = telegram_finance_news_record(

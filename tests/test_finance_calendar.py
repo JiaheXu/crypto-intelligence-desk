@@ -155,6 +155,23 @@ company_finance_reports:
 
         self.assertEqual(result, {"important": True, "summary": "ok"})
 
+    def test_telegram_finance_news_record_keeps_affected_stocks(self):
+        ai = proxy._ai_json('{"important":true,"affected_stocks":["ASML","NVDA","SK Hynix"],"positive_affected_stocks":["NVDA"],"negative_affected_stocks":["SKHYNIX"],"positive_affected_sectors":["AI"],"negative_affected_sectors":["memory"],"type":"warning_message"}')
+
+        record = proxy.telegram_finance_news_record(
+            ai,
+            chat_name="tradfi",
+            msg_id=125,
+            text="China DUV machines challenge ASML",
+            timestamp="2026-07-07 14:02:00",
+        )
+
+        self.assertEqual(record["affected_stocks"], ["ASML", "NVDA", "SK Hynix"])
+        self.assertEqual(record["positive_affected_stocks"], ["NVDA"])
+        self.assertEqual(record["negative_affected_stocks"], ["SKHYNIX"])
+        self.assertEqual(record["positive_affected_sectors"], ["AI"])
+        self.assertEqual(record["negative_affected_sectors"], ["memory"])
+
     def test_finance_ai_text_fallback_builds_record_fields(self):
         result = proxy._ai_json("美联储释放降息信号，利好风险资产和 BTC。")
 
@@ -231,7 +248,7 @@ company_finance_reports:
         self.assertEqual(feed[0]["title"], "Fed cuts rates")
         self.assertEqual(feed[0]["body"], "Fed cuts rates")
 
-    def test_telegram_finance_news_logs_receive_and_ai_parse_success_without_details(self):
+    def test_telegram_finance_news_logs_compact_receive_and_ai_parse_summary(self):
         original_ai = proxy._post_finance_ai
         original_send = proxy._send_receiver_packet
         original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
@@ -243,6 +260,7 @@ company_finance_reports:
                 "important": True,
                 "summary": "美联储暗示降息",
                 "btc_price": "increase",
+                "conf": 82,
             }
             proxy._send_receiver_packet = lambda _packet: None
             out = io.StringIO()
@@ -254,7 +272,7 @@ company_finance_reports:
                         "source": "telegram",
                         "chat_name": "tradfi",
                         "msg_id": 123,
-                        "text": "Fed cuts rates",
+                        "text": "Fed cuts rates and signals more cuts next quarter",
                         "timestamp": "2026-07-07 14:00:00",
                     }
                 )
@@ -266,10 +284,31 @@ company_finance_reports:
             proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
 
         logs = out.getvalue()
-        self.assertIn("[proxy] telegram finance msg received source=telegram chat=tradfi msg_id=123 text_len=14", logs)
-        self.assertIn("[proxy] AI parsed telegram finance msg source=telegram chat=tradfi msg_id=123", logs)
-        self.assertNotIn("Fed cuts rates", logs)
+        self.assertIn("[proxy] 1 msg from \033[32mtelegram\033[0m chat=\033[34mtradfi\033[0m", logs)
+        self.assertIn("[proxy] AI parsing: \033[32mimportant\033[0m / \033[32mincrease\033[0m / \033[32m82\033[0m", logs)
+        self.assertIn("[proxy] raw text: Fed cuts rates and signals mor", logs)
+        self.assertNotIn("next quarter", logs)
         self.assertNotIn("美联储暗示降息", logs)
+
+    def test_ai_parsing_log_includes_affected_stocks(self):
+        log = proxy._ai_parsing_log(
+            {
+                "important": True,
+                "btc_price": "neutral",
+                "conf": 70,
+                "affected_stocks": ["NVDA", "MU"],
+                "affected_sectors": ["AI infrastructure", "memory"],
+                "positive_affected_stocks": ["NVDA"],
+                "negative_affected_stocks": ["MU"],
+                "positive_affected_sectors": ["AI infrastructure"],
+                "negative_affected_sectors": ["memory"],
+            }
+        )
+
+        self.assertIn("stocks=NVDA,MU", log)
+        self.assertIn("sectors=AI infrastructure,memory", log)
+        self.assertIn("positively affected sector: \033[32mAI infrastructure\033[0m, stocks: \033[32mNVDA\033[0m", log)
+        self.assertIn("negatively affected sector: \033[31mmemory\033[0m, stocks: \033[31mMU\033[0m", log)
 
     def test_duplicate_telegram_finance_packet_skips_ai(self):
         original_ai = proxy._post_finance_ai
@@ -683,6 +722,7 @@ company_finance_reports:
         original_key = proxy.FINANCE_AI_KEY
         original_urlopen = proxy.urllib.request.urlopen
         original_sleep = proxy.time.sleep
+        original_watchlist = proxy.SYMBOL_WATCHLIST
         calls = []
 
         class Response:
@@ -704,17 +744,58 @@ company_finance_reports:
 
         try:
             proxy.FINANCE_AI_KEY = "test-key"
+            proxy.SYMBOL_WATCHLIST = [{"symbol": "QQQ", "name": "Invesco QQQ Trust"}]
             proxy.urllib.request.urlopen = fake_urlopen
             proxy.time.sleep = lambda _seconds: None
 
             result = proxy._post_finance_ai("hello")
         finally:
             proxy.FINANCE_AI_KEY = original_key
+            proxy.SYMBOL_WATCHLIST = original_watchlist
             proxy.urllib.request.urlopen = original_urlopen
             proxy.time.sleep = original_sleep
 
         self.assertEqual(result["summary"], "ok")
         self.assertEqual(len(calls), 2)
+
+    def test_finance_ai_prompt_includes_symbol_watchlist(self):
+        original_key = proxy.FINANCE_AI_KEY
+        original_urlopen = proxy.urllib.request.urlopen
+        original_watchlist = proxy.SYMBOL_WATCHLIST
+        bodies = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"choices":[{"message":{"content":"{\\"important\\":true,\\"summary\\":\\"ok\\"}"}}]}'
+
+        def fake_urlopen(req, timeout=None):
+            bodies.append(json.loads(req.data.decode("utf-8")))
+            return Response()
+
+        try:
+            proxy.FINANCE_AI_KEY = "test-key"
+            proxy.SYMBOL_WATCHLIST = [
+                {"symbol": "BTC", "name": "Bitcoin"},
+                {"symbol": "QQQ", "name": "Invesco QQQ Trust"},
+            ]
+            proxy.urllib.request.urlopen = fake_urlopen
+
+            proxy._post_finance_ai("news")
+        finally:
+            proxy.FINANCE_AI_KEY = original_key
+            proxy.SYMBOL_WATCHLIST = original_watchlist
+            proxy.urllib.request.urlopen = original_urlopen
+
+        prompt = bodies[0]["messages"][1]["content"]
+        self.assertIn("- BTC: Bitcoin", prompt)
+        self.assertIn("- QQQ: Invesco QQQ Trust", prompt)
+        self.assertNotIn("{symbol_watchlist}", prompt)
 
     def test_finance_ai_stops_after_json_retry_limit(self):
         original_key = proxy.FINANCE_AI_KEY
@@ -760,6 +841,16 @@ company_finance_reports:
         self.assertNotIn('class="sSrc"', source)
         self.assertNotIn('class="sUrl"', source)
         self.assertIn('"priced_in":true或false,"why"', source)
+        self.assertIn('"affected_stocks":["受影响股票/ETF/商品符号,最多8个"]', source)
+        self.assertIn('"affected_sectors":["受影响板块/产业链,最多5个"]', source)
+        self.assertIn('"positive_affected_stocks":["正面影响股票/ETF/商品符号,最多8个"]', source)
+        self.assertIn('"negative_affected_stocks":["负面影响股票/ETF/商品符号,最多8个"]', source)
+        self.assertIn("a.affected_stocks=", source)
+        self.assertIn("a.affected_sectors=", source)
+        self.assertIn("positively affected sector:", source)
+        self.assertIn("negatively affected sector:", source)
+        self.assertIn("class=\"pos\"", source)
+        self.assertIn("class=\"neg\"", source)
         self.assertNotIn('"news_label":["macro_rate_policy"]', source)
         self.assertNotIn("a.news_label=normList(a.news_label,4);", source)
         self.assertNotIn("事件 · ${esc(a.news_point)}", source)

@@ -1,0 +1,187 @@
+symbol_watchlist:
+  - symbol: BTC
+    name: Bitcoin
+  - symbol: AAOI
+    name: Applied Optoelectronics
+  - symbol: AAPL
+    name: Apple
+  - symbol: ADBE
+    name: Adobe
+  - symbol: AMD
+    name: Advanced Micro Devices
+  - symbol: AMZN
+    name: Amazon
+  - symbol: ANTHROPIC
+    name: Anthropic
+  - symbol: APLD
+    name: Applied Digital
+  - symbol: ARM
+    name: Arm Holdings
+  - symbol: ASTS
+    name: AST SpaceMobile
+  - symbol: AVGO
+    name: Broadcom
+  - symbol: BE
+    name: Bloom Energy
+  - symbol: BRKB
+    name: Berkshire Hathaway Class B
+  - symbol: BZ
+    name: Kanzhun
+  - symbol: CBRS
+    name: CBRS
+  - symbol: CIFR
+    name: Cipher Mining
+  - symbol: CL
+    name: WTI crude oil
+  - symbol: COIN
+    name: Coinbase
+  - symbol: CONL
+    name: GraniteShares 2x Long COIN Daily ETF
+  - symbol: COPPER
+    name: Copper
+  - symbol: CRCL
+    name: Circle Internet Group
+  - symbol: CRWV
+    name: CoreWeave
+  - symbol: CVX
+    name: Chevron
+  - symbol: DASH
+    name: DoorDash
+  - symbol: DELL
+    name: Dell Technologies
+  - symbol: DOGE
+    name: Dogecoin
+  - symbol: DRAM
+    name: DRAM memory sector
+  - symbol: EWJ
+    name: iShares MSCI Japan ETF
+  - symbol: EWY
+    name: iShares MSCI South Korea ETF
+  - symbol: FIGMA
+    name: Figma
+  - symbol: FNGU
+    name: MicroSectors FANG+ 3X Leveraged ETN
+  - symbol: GAS
+    name: Natural gas
+  - symbol: GDXU
+    name: MicroSectors Gold Miners 3X Leveraged ETN
+  - symbol: GLW
+    name: Corning
+  - symbol: GOOGL
+    name: Alphabet
+  - symbol: HOOD
+    name: Robinhood Markets
+  - symbol: IBM
+    name: IBM
+  - symbol: INTC
+    name: Intel
+  - symbol: IONQ
+    name: IonQ
+  - symbol: IREN
+    name: IREN Limited
+  - symbol: KORU
+    name: Direxion Daily South Korea Bull 3X Shares
+  - symbol: LABU
+    name: Direxion Daily S&P Biotech Bull 3X Shares
+  - symbol: LITE
+    name: Lumentum Holdings
+  - symbol: META
+    name: Meta Platforms
+  - symbol: MINIMAX
+    name: MiniMax
+  - symbol: MP
+    name: MP Materials
+  - symbol: MRVL
+    name: Marvell Technology
+  - symbol: MSFT
+    name: Microsoft
+  - symbol: MSTR
+    name: MicroStrategy
+  - symbol: MTL
+    name: Mechel
+  - symbol: MTSI
+    name: MACOM Technology Solutions
+  - symbol: MU
+    name: Micron Technology
+  - symbol: MVLL
+    name: Marvell alias
+  - symbol: MXL
+    name: MaxLinear
+  - symbol: NATGAS
+    name: Natural gas
+  - symbol: NBIS
+    name: Nebius Group
+  - symbol: NFLX
+    name: Netflix
+  - symbol: NOK
+    name: Nokia
+  - symbol: NOW
+    name: ServiceNow
+  - symbol: NVDA
+    name: NVIDIA
+  - symbol: NVDL
+    name: GraniteShares 2x Long NVDA Daily ETF
+  - symbol: NVO
+    name: Novo Nordisk
+  - symbol: OKLO
+    name: Oklo
+  - symbol: OPENAI
+    name: OpenAI
+  - symbol: ORCL
+    name: Oracle
+  - symbol: PLTR
+    name: Palantir Technologies
+  - symbol: PLUSDT
+    name: PLUSDT
+  - symbol: QCOM
+    name: Qualcomm
+  - symbol: QQQ
+    name: Invesco QQQ Trust
+  - symbol: RDW
+    name: Redwire
+  - symbol: RKLB
+    name: Rocket Lab
+  - symbol: SIVE
+    name: SIVE
+  - symbol: SKHY
+    name: SK Hynix alias
+  - symbol: SKHYNIX
+    name: SK Hynix
+  - symbol: SMTC
+    name: Semtech
+  - symbol: SNDK
+    name: SanDisk
+  - symbol: SNOW
+    name: Snowflake
+  - symbol: SNXX
+    name: SNXX
+  - symbol: SONY
+    name: Sony
+  - symbol: SOXL
+    name: Direxion Daily Semiconductor Bull 3X Shares
+  - symbol: SOXX
+    name: iShares Semiconductor ETF
+  - symbol: SPCX
+    name: SPAC and New Issue ETF
+  - symbol: SPY
+    name: SPDR S&P 500 ETF Trust
+  - symbol: SQQQ
+    name: ProShares UltraPro Short QQQ
+  - symbol: STX
+    name: Seagate Technology
+  - symbol: TQQQ
+    name: ProShares UltraPro QQQ
+  - symbol: TSM
+    name: Taiwan Semiconductor Manufacturing
+  - symbol: TSLA
+    name: Tesla
+  - symbol: TSLL
+    name: Direxion Daily TSLA Bull 2X Shares
+  - symbol: TXN
+    name: Texas Instruments
+  - symbol: WDC
+    name: Western Digital
+  - symbol: XAG
+    name: Silver
+  - symbol: XAU
+    name: Gold

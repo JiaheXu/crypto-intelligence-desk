@@ -14,6 +14,12 @@ Schema:
   "lt": "正面|负面|中性",
   "level": 1,
   "conf": 80,
+  "affected_stocks": ["ASML"],
+  "affected_sectors": ["semiconductor equipment"],
+  "positive_affected_stocks": ["NVDA"],
+  "negative_affected_stocks": ["SKHYNIX"],
+  "positive_affected_sectors": ["AI infrastructure"],
+  "negative_affected_sectors": ["memory"],
   "coins": ["BTC", "NASDAQ"],
   "cat": "宏观",
   "news_label": ["macro_rate_policy"],
@@ -40,6 +46,10 @@ Allowed values:
 - st and lt: 正面, 负面, 中性
 - level: 1, 2, 3, 4, 5
 - conf: integer from 0 to 100
+- affected_stocks: stock tickers, ETFs, indexes, ADRs, or company names directly or materially affected by the news
+- affected_sectors: broad affected sectors or supply-chain areas
+- positive_affected_stocks/negative_affected_stocks: affected symbols split by likely impact direction
+- positive_affected_sectors/negative_affected_sectors: affected sectors split by likely impact direction
 - coins: BTC, ETH, SOL, BNB, NASDAQ, S&P500, DOW, DXY, GOLD, OIL, NVDA, TSLA, AAPL, MSFT, META, GOOGL, AMZN, COIN, MSTR, 美股科技股, 韩股科技股, 半导体, AI, unknown
 - cat: 监管, ETF, 宏观, 安全, 上币, 解锁, 机构, 技术, 生态, 其他
 - news_label: macro_rate_policy, earnings_event, geopolitical_risk, sector_catalyst, liquidity_drain, policy_intervention, market_session_signal, crowding_positioning, cross_asset_signal, binary_event_risk, priced_in_or_stale, exchange_platform_risk, regulatory_policy, unknown
@@ -52,24 +62,30 @@ Allowed values:
 - binary_event_risk: true, false
 - gap: none, exact_event_time, fed_funds_probability, etf_flow, earnings_date, policy_details, treaty_terms, source_confirmation, liquidity_size, market_reaction, positioning_data, valuation_data, other
 
+Symbol watchlist:
+{symbol_watchlist}
+
 Decision rules:
 1. Mark unrelated=true when the message has little or no connection to BTC, crypto majors, US tech stocks, Korean tech stocks, rates, USD, gold, oil, or broad risk appetite. Do not retry unrelated messages; return unrelated=true and important=false.
 2. Mark important=true only when the message can move BTC, crypto majors, US tech stocks, Korean tech stocks, rates, USD, gold, oil, or broad risk appetite.
 3. Most messages are level 1-2. Use level 4-5 only for news that can plausibly move markets sharply.
 4. Use direction for the overall market read. Use st for short-term impact and lt for longer-term impact.
-5. Use coins for directly affected assets, tickers, indexes, or sectors. Use unknown only when no listed item fits.
-6. Use cat for the page-level category and news_label for the more detailed catalyst type.
-7. news_point must state the factual catalyst. news_implication must state the likely market consequence.
-8. If the message is risk-off for US tech stocks, BTC usually also decreases unless there is a clear crypto-specific reason.
-9. action should match the Dabing trading style: trade only with a clear edge; use wait or avoid for noisy, stale, or binary-event news.
-10. Set priced_in=true when the message is old, widely expected, or already reflected in price.
-11. Set binary_event_risk=true for CPI, FOMC, earnings, war/peace announcements, lawsuits, approvals, listings, or any catalyst where outcome is uncertain and one headline can reverse the trade.
-12. gap must choose the missing data needed to trust the implication. Use none only when no extra data is needed.
-13. For unimportant or unrelated messages, set important=false, direction="中性", st="中性", lt="中性", level=1, action="none", bias="n/a", conf<=50, and use neutral or unclear for price fields.
-14. Use earnings_event for earnings, guidance, sales, revenue, or company report catalysts.
-15. Use policy_intervention for Fed/government/Trump rescue, jawboning, suppression, or direct policy support/threats.
-16. Use market_session_signal for premarket/open/close behavior, gap-up-then-fade, weekend/session timing, or trading-window signals.
-17. Do not overrate ordinary data. CPI/FOMC/FedWatch/rate-odds changes can alter the thesis; unemployment/nonfarm/GDP data is lower impact unless it changes rate expectations, liquidity, sector cycle, or broad risk appetite.
+5. Fill affected_stocks only with symbols from the Symbol watchlist that are directly or materially affected by the news. Use [] when none are relevant.
+6. Fill affected_sectors with broad affected sectors or supply-chain areas, for example ["AI infrastructure","memory","semiconductor equipment","Korea tech","crypto miners"]. Use [] when none are relevant.
+7. Split affected symbols and sectors by expected direction into positive_affected_stocks, negative_affected_stocks, positive_affected_sectors, and negative_affected_sectors. Use [] when the side is unclear.
+8. Use coins for directly affected crypto assets only. Use unknown only when no listed item fits.
+9. Use cat for the page-level category and news_label for the more detailed catalyst type.
+10. news_point must state the factual catalyst. news_implication must state the likely market consequence.
+11. If the message is risk-off for US tech stocks, BTC usually also decreases unless there is a clear crypto-specific reason.
+12. action should match the Dabing trading style: trade only with a clear edge; use wait or avoid for noisy, stale, or binary-event news.
+13. Set priced_in=true when the message is old, widely expected, or already reflected in price.
+14. Set binary_event_risk=true for CPI, FOMC, earnings, war/peace announcements, lawsuits, approvals, listings, or any catalyst where outcome is uncertain and one headline can reverse the trade.
+15. gap must choose the missing data needed to trust the implication. Use none only when no extra data is needed.
+16. For unimportant or unrelated messages, set important=false, direction="中性", st="中性", lt="中性", level=1, action="none", bias="n/a", conf<=50, and use neutral or unclear for price fields.
+17. Use earnings_event for earnings, guidance, sales, revenue, or company report catalysts.
+18. Use policy_intervention for Fed/government/Trump rescue, jawboning, suppression, or direct policy support/threats.
+19. Use market_session_signal for premarket/open/close behavior, gap-up-then-fade, weekend/session timing, or trading-window signals.
+20. Do not overrate ordinary data. CPI/FOMC/FedWatch/rate-odds changes can alter the thesis; unemployment/nonfarm/GDP data is lower impact unless it changes rate expectations, liquidity, sector cycle, or broad risk appetite.
 
 Message:
 <<<
