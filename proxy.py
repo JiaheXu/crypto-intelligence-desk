@@ -870,14 +870,17 @@ def _remember_similar_telegram_finance(payload, result):
 
 
 def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
+    coins = _string_list(result.get("coins"))
+    core_coins = [coin for coin in coins if str(coin).strip().upper() in {"BTC", "ETH"}]
+    altcoin_only = bool(coins) and not core_coins
     return {
         "source": "telegram",
         "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
         "timestamp": timestamp,
         "chat_name": str(chat_name or "").strip(),
         "msg_id": msg_id,
-        "important": _json_bool(result.get("important")),
-        "unrelated": _json_bool(result.get("unrelated")),
+        "important": False if altcoin_only else _json_bool(result.get("important")),
+        "unrelated": True if altcoin_only else _json_bool(result.get("unrelated")),
         "summary": str(result.get("summary") or "").strip(),
         "reason": str(result.get("reason") or "").strip(),
         "affected_stocks": _string_list(result.get("affected_stocks")),
@@ -891,12 +894,12 @@ def telegram_finance_news_record(result, *, chat_name, msg_id, text, timestamp):
         "lt": str(result.get("lt") or "中性").strip(),
         "level": _int_range(result.get("level"), 1, 1, 5),
         "conf": _int_range(result.get("conf"), 0, 0, 100),
-        "coins": _string_list(result.get("coins")),
+        "coins": core_coins if altcoin_only else coins,
         "cat": str(result.get("cat") or "其他").strip(),
         "news_label": _string_list(result.get("news_label")),
         "news_point": str(result.get("news_point") or "").strip(),
         "news_implication": str(result.get("news_implication") or "").strip(),
-        "btc_price": _direction(result.get("btc_price")),
+        "btc_price": "unclear" if altcoin_only else _direction(result.get("btc_price")),
         "us_tech_stocks": _direction(result.get("us_tech_stocks")),
         "korean_tech_stocks": _direction(result.get("korean_tech_stocks")),
         "action": str(result.get("action") or "none").strip().lower(),

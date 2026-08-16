@@ -192,6 +192,27 @@ company_finance_reports:
 
         self.assertTrue(record["unrelated"])
 
+    def test_telegram_finance_news_record_ignores_altcoin_only_crypto_news(self):
+        record = proxy.telegram_finance_news_record(
+            {
+                "important": True,
+                "unrelated": False,
+                "summary": "PEPE whale buys DOGE",
+                "coins": ["PEPE", "DOGE"],
+                "cat": "加密市场结构",
+                "btc_price": "increase",
+            },
+            chat_name="crypto",
+            msg_id=126,
+            text="PEPE whale buys DOGE after meme coin listing",
+            timestamp="2026-07-07 14:03:00",
+        )
+
+        self.assertFalse(record["important"])
+        self.assertTrue(record["unrelated"])
+        self.assertEqual(record["coins"], [])
+        self.assertEqual(record["btc_price"], "unclear")
+
     def test_telegram_finance_news_record_keeps_raw_text_for_dabing(self):
         record = proxy.telegram_finance_news_record(
             {"important": True, "unrelated": False, "summary": "降息", "reason": "macro"},
