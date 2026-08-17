@@ -305,11 +305,110 @@ company_finance_reports:
             proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
 
         logs = out.getvalue()
-        self.assertIn("[proxy] 1 msg from \033[32mtelegram\033[0m chat=\033[34mtradfi\033[0m", logs)
+        self.assertIn("[proxy] msg from \033[32mtelegram\033[0m chat=\033[34mtradfi\033[0m", logs)
         self.assertIn("[proxy] AI parsing: \033[32mimportant\033[0m / \033[32mincrease\033[0m / \033[32m82\033[0m", logs)
         self.assertIn("[proxy] raw text: Fed cuts rates and signals mor", logs)
+        self.assertNotIn("1 msg", logs)
         self.assertNotIn("next quarter", logs)
         self.assertNotIn("美联储暗示降息", logs)
+
+    def test_telegram_finance_ai_timeout_keeps_item_without_raising(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy._post_finance_ai = lambda _text: (_ for _ in ()).throw(TimeoutError("timed out"))
+            proxy._send_receiver_packet = lambda _packet: None
+            out = io.StringIO()
+
+            with contextlib.redirect_stdout(out):
+                result = proxy.ingest_telegram_finance_packet(
+                    {
+                        "type": "telegram_finance_news",
+                        "source": "telegram",
+                        "chat_name": "tradfi",
+                        "msg_id": 124,
+                        "text": "China data preview",
+                        "timestamp": "2026-07-07 14:01:00",
+                    }
+                )
+
+            feed = proxy.telegram_finance_feed_items()
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["ai_timeout"])
+        self.assertFalse(result["sent"])
+        self.assertEqual(feed[0]["body"], "China data preview")
+        self.assertIn("[proxy] telegram finance AI timed out", out.getvalue())
+
+    def test_telegram_finance_ai_timeout_retries_once_and_sends_if_important(self):
+        class ImmediateTimer:
+            def __init__(self, _delay, fn, args=()):
+                self.fn = fn
+                self.args = args
+                self.daemon = False
+
+            def start(self):
+                self.fn(*self.args)
+
+        sent = []
+        calls = []
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_timer = proxy.threading.Timer
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+
+            def fake_ai(text):
+                calls.append(text)
+                if len(calls) == 1:
+                    raise TimeoutError("timed out")
+                return {
+                    "important": True,
+                    "summary": "China data matters",
+                    "btc_price": "decrease",
+                }
+
+            proxy._post_finance_ai = fake_ai
+            proxy._send_receiver_packet = sent.append
+            proxy.threading.Timer = ImmediateTimer
+
+            result = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "tradfi",
+                    "msg_id": 125,
+                    "text": "China data preview",
+                    "timestamp": "2026-07-07 14:02:00",
+                }
+            )
+            feed = proxy.telegram_finance_feed_items()
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.threading.Timer = original_timer
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+
+        self.assertTrue(result["ai_timeout"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["price_direction"], "decrease")
+        self.assertEqual(feed[0]["ai_summary"], "China data matters")
 
     def test_ai_parsing_log_includes_affected_stocks(self):
         log = proxy._ai_parsing_log(

@@ -91,6 +91,7 @@ FINANCE_AI_MODEL = os.environ.get(
 )
 FINANCE_AI_TIMEOUT = float(os.environ.get("INFO_PARSER_TIMEOUT", "30") or 30)
 FINANCE_AI_JSON_RETRIES = int(os.environ.get("INFO_PARSER_JSON_RETRIES", "3") or 3)
+FINANCE_AI_RETRY_DELAY_SECONDS = float(os.environ.get("INFO_PARSER_RETRY_DELAY_SECONDS", "15") or 15)
 ALLOWED_APP_ORIGINS = {
     "http://127.0.0.1:%d" % PORT,
     "http://localhost:%d" % PORT,
@@ -732,6 +733,27 @@ def _remember_telegram_finance_item(payload):
     return row
 
 
+def _update_telegram_finance_item_ai(record):
+    chat_name = str(record.get("chat_name") or "Telegram").strip() or "Telegram"
+    msg_id = str(record.get("msg_id") or "").strip()
+    if not msg_id:
+        return
+    item_id = f"tg:{chat_name}:{msg_id}"
+    with TELEGRAM_FINANCE_LOCK:
+        for item in TELEGRAM_FINANCE_ITEMS:
+            if item.get("id") == item_id:
+                item.update(
+                    {
+                        "ai_summary": str(record.get("summary") or "").strip(),
+                        "important": bool(record.get("important")),
+                        "btc_price": record.get("btc_price") or "unclear",
+                        "us_tech_stocks": record.get("us_tech_stocks") or "unclear",
+                        "korean_tech_stocks": record.get("korean_tech_stocks") or "unclear",
+                    }
+                )
+                return
+
+
 def _archive_row_payload(row):
     text = str(row.get("text") or "").strip()
     if not text:
@@ -977,6 +999,14 @@ def _post_finance_ai(text):
     raise RuntimeError(f"自动重试 {FINANCE_AI_JSON_RETRIES} 次后仍未返回有效 JSON") from last_error
 
 
+def _is_timeout_error(exc):
+    if isinstance(exc, TimeoutError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(getattr(exc, "reason", None), TimeoutError)
+    return False
+
+
 def _send_receiver_packet(packet):
     data = json.dumps(packet, ensure_ascii=False).encode("utf-8")
     for port in RECEIVER_UDP_PORTS or [11000]:
@@ -989,20 +1019,10 @@ def _send_receiver_packet(packet):
             sock.close()
 
 
-def process_telegram_finance_news(payload):
-    source = str(payload.get("source") or "telegram").strip().lower()
-    if source not in {"telegram", "discord"}:
-        raise ValueError("source must be telegram or discord")
+def _telegram_finance_result_from_ai(payload, ai_result, *, ai_timeout=False):
     text = str(payload.get("text") or "").strip()
-    if not text:
-        raise ValueError("text is required")
     chat_name = str(payload.get("chat_name") or "telegram").strip() or "telegram"
     msg_id = payload.get("msg_id")
-    print(f"[proxy] 1 msg from {_ansi(source, ANSI_GREEN)} chat={_ansi(chat_name, ANSI_BLUE)}")
-    raw_snippet = re.sub(r"\s+", " ", text)[:30]
-    print(f"[proxy] raw text: {raw_snippet}")
-    ai_result = _post_finance_ai(text)
-    print(_ai_parsing_log(ai_result))
     if _has_important_person_name(text):
         ai_result["important"] = True
     record = telegram_finance_news_record(
@@ -1012,11 +1032,68 @@ def process_telegram_finance_news(payload):
         text=text,
         timestamp=payload.get("timestamp") or datetime.utcnow().isoformat(timespec="seconds"),
     )
+    _update_telegram_finance_item_ai(record)
     sent = False
     if record.get("important") and _direction(record.get("btc_price")) in {"increase", "decrease"}:
         _send_receiver_packet(build_telegram_finance_warning_packet(record))
         sent = True
-    return {"ok": True, "important": bool(record.get("important")), "unrelated": bool(record.get("unrelated")), "sent": sent, "record": record}
+    return {
+        "ok": True,
+        "important": bool(record.get("important")),
+        "unrelated": bool(record.get("unrelated")),
+        "sent": sent,
+        "ai_timeout": ai_timeout,
+        "record": record,
+    }
+
+
+def _retry_telegram_finance_ai(payload, dedupe_key):
+    try:
+        ai_result = _post_finance_ai(str(payload.get("text") or ""))
+        result = _telegram_finance_result_from_ai(payload, ai_result)
+        _remember_processed_telegram_finance(dedupe_key, result)
+        _remember_similar_telegram_finance(payload, result)
+        _archive_telegram_finance_news(payload, result=result)
+        print("[proxy] telegram finance AI retry succeeded")
+    except Exception as exc:
+        print(f"[proxy] telegram finance AI retry failed: {exc}")
+
+
+def _schedule_telegram_finance_ai_retry(payload, dedupe_key):
+    timer = threading.Timer(FINANCE_AI_RETRY_DELAY_SECONDS, _retry_telegram_finance_ai, args=(dict(payload), dedupe_key))
+    timer.daemon = True
+    timer.start()
+
+
+def process_telegram_finance_news(payload):
+    source = str(payload.get("source") or "telegram").strip().lower()
+    if source not in {"telegram", "discord"}:
+        raise ValueError("source must be telegram or discord")
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required")
+    chat_name = str(payload.get("chat_name") or "telegram").strip() or "telegram"
+    msg_id = payload.get("msg_id")
+    print(f"[proxy] msg from {_ansi(source, ANSI_GREEN)} chat={_ansi(chat_name, ANSI_BLUE)}")
+    raw_snippet = re.sub(r"\s+", " ", text)[:30]
+    print(f"[proxy] raw text: {raw_snippet}")
+    ai_timeout = False
+    try:
+        ai_result = _post_finance_ai(text)
+        print(_ai_parsing_log(ai_result))
+    except Exception as exc:
+        if not _is_timeout_error(exc):
+            raise
+        ai_timeout = True
+        print(f"[proxy] telegram finance AI timed out: {exc}")
+        ai_result = {
+            "important": False,
+            "unrelated": False,
+            "summary": "",
+            "reason": "AI parser timed out",
+            "btc_price": "unclear",
+        }
+    return _telegram_finance_result_from_ai(payload, ai_result, ai_timeout=ai_timeout)
 
 
 def ingest_telegram_finance_packet(payload):
@@ -1042,6 +1119,8 @@ def ingest_telegram_finance_packet(payload):
     _remember_processed_telegram_finance(dedupe_key, result)
     _remember_similar_telegram_finance(payload, result)
     _archive_telegram_finance_news(payload, result=result)
+    if result.get("ai_timeout"):
+        _schedule_telegram_finance_ai_retry(payload, dedupe_key)
     return result
 
 
