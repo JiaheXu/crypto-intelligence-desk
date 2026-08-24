@@ -49,6 +49,12 @@ Decision rules:
 9. Use news_label for all useful secondary categories, for example ["AI算力","半导体存储","美股科技"].
 10. Use reason_tags for compact reasons, for example ["Trump","tariff","HBM","NVDA","BTC ETF","rate expectation"].
 11. Fill coins only for crypto symbols directly mentioned. Do not put stock tickers in coins.
+12. You may infer btc_price from macro liquidity, real yields, USD pressure, and broad risk appetite even when BTC is not directly mentioned.
+Use these examples as causal templates: identify the policy/data/technology catalyst, map it to liquidity, real yields, USD, regulation clarity, tech competition, or broad risk appetite, then choose btc_price, us_tech_stocks, and korean_tech_stocks from the inferred market impact.
+13. Treasury long-end bond buybacks, larger long-end buyback operations, falling long-end yields, weaker USD, or explicit liquidity support usually mean btc_price="increase". If the same message says inflation is sticky, the Fed is hawkish, yields are rising, or the buyback effect failed/reversed, use btc_price="decrease" or "neutral" instead.
+14. Crypto policy that improves legal clarity, institutional access, custody, ETF access, stablecoin rules, or exchange/compliance certainty usually means btc_price="increase"; examples include CLARITY Act, SEC/CFTC jurisdiction clarity, ETF approval, and bank custody permission. Enforcement crackdowns, exchange restrictions, AML sanctions, custody bans, ETF rejection/delay, or hostile tax rules usually mean btc_price="decrease". Process-only headlines with no implementation detail can be neutral or unclear.
+15. Government data affects BTC through the Fed path, real yields, USD, and liquidity. Cooler CPI/PPI, weaker-but-not-panic jobs data, or soft growth that raises cut expectations usually means btc_price="increase". Hot CPI/PPI, strong wage/jobs data that keeps policy tight, bad Treasury auctions, rising term premium, or long-yield stress usually means btc_price="decrease". Recession panic can also be decrease even if cuts become more likely.
+16. Chinese tech company breakthroughs affect tech stocks first. Chinese tech, AI chip, semiconductor, robotics, battery, or platform-AI news should change us_tech_stocks/korean_tech_stocks before BTC. Set btc_price only when the message clearly links to crypto, crypto miners, global risk-on flow, liquidity, or broad China/HK tech risk appetite.
 
 Message:
 <<<

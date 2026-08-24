@@ -62,7 +62,7 @@ MAX_REQUEST_BODY = 2 * 1024 * 1024
 MAX_RESPONSE_BODY = 12 * 1024 * 1024
 TELEGRAM_FINANCE_TTL_MS = 5 * 60 * 1000
 TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD = float(os.environ.get("TELEGRAM_FINANCE_DEDUPE_SIMILARITY_THRESHOLD", "0.90") or 0.90)
-TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS = int(os.environ.get("TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS", "14400") or 14400)
+TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS = int(os.environ.get("TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS", "86400") or 86400)
 TELEGRAM_FINANCE_DEDUPE_RECENT_LIMIT = int(os.environ.get("TELEGRAM_FINANCE_DEDUPE_RECENT_LIMIT", "200") or 200)
 TELEGRAM_FINANCE_UDP_HOST = os.environ.get("CID_TELEGRAM_FINANCE_UDP_HOST", "127.0.0.1").strip() or "127.0.0.1"
 TELEGRAM_FINANCE_UDP_PORT = int(os.environ.get("CID_TELEGRAM_FINANCE_UDP_PORT", os.environ.get("FINANCE_NEWS_PROXY_UDP_PORT", "5201")) or 5201)
@@ -723,6 +723,10 @@ def _remember_telegram_finance_item(payload):
         "url": "#",
         "src": chat_name,
     }
+    if isinstance(payload.get("ai"), dict):
+        row["ai"] = dict(payload["ai"])
+    if payload.get("ai_timeout"):
+        row["ai_timeout"] = True
     with TELEGRAM_FINANCE_LOCK:
         existing = next((idx for idx, item in enumerate(TELEGRAM_FINANCE_ITEMS) if item.get("id") == row["id"]), -1)
         if existing >= 0:
@@ -744,6 +748,7 @@ def _update_telegram_finance_item_ai(record):
             if item.get("id") == item_id:
                 item.update(
                     {
+                        "ai": dict(record),
                         "ai_summary": str(record.get("summary") or "").strip(),
                         "important": bool(record.get("important")),
                         "btc_price": record.get("btc_price") or "unclear",
@@ -761,7 +766,7 @@ def _archive_row_payload(row):
     timestamp = str(row.get("timestamp") or row.get("received_at") or "").strip()
     chat_name = str(row.get("chat_name") or row.get("source") or "Telegram").strip() or "Telegram"
     msg_id = row.get("msg_id") or row.get("received_at") or f"archive:{timestamp}:{abs(hash(text))}"
-    return {
+    payload = {
         "type": "telegram_finance_news",
         "source": str(row.get("source") or "telegram").strip() or "telegram",
         "chat_name": chat_name,
@@ -769,6 +774,11 @@ def _archive_row_payload(row):
         "text": text,
         "timestamp": timestamp,
     }
+    if isinstance(row.get("ai"), dict):
+        payload["ai"] = dict(row["ai"])
+    if row.get("ai_timeout"):
+        payload["ai_timeout"] = True
+    return payload
 
 
 def load_recent_telegram_finance_archive(limit=5):
@@ -822,10 +832,18 @@ def _normalize_telegram_finance_text(text):
 def _telegram_finance_number_tokens(text):
     return tuple(
         re.findall(
-            r"(?<!\w)[+-]?\d+(?:\.\d+)?\s*(?:%|bp|bps|亿美元|万亿|亿|万|美元|usdt|btc|eth)?",
+            r"(?<![a-z0-9_])[+-]?\d+(?:\.\d+)?\s*(?:%|bp|bps|亿美元|万亿|亿|万|美元|usdt|btc|eth)?",
             str(text or "").lower(),
         )
     )
+
+
+def _telegram_finance_anchor_tokens(normalized):
+    return {
+        token
+        for token in str(normalized or "").split()
+        if len(token) >= 8 and re.search(r"\d", token)
+    }
 
 
 def _telegram_finance_dedupe_key(payload):
@@ -856,6 +874,7 @@ def _cached_similar_telegram_finance(payload):
     now_ms = _parse_time_ms(payload.get("timestamp"))
     window_ms = max(0, TELEGRAM_FINANCE_DEDUPE_WINDOW_SECONDS) * 1000
     numbers = _telegram_finance_number_tokens(text)
+    anchors = _telegram_finance_anchor_tokens(normalized)
     with TELEGRAM_FINANCE_PROCESSED_LOCK:
         recent = []
         for item in TELEGRAM_FINANCE_RECENT_DEDUPE:
@@ -865,9 +884,12 @@ def _cached_similar_telegram_finance(payload):
         if len(recent) != len(TELEGRAM_FINANCE_RECENT_DEDUPE):
             TELEGRAM_FINANCE_RECENT_DEDUPE[:] = recent
         for item in recent:
-            if numbers != item["numbers"]:
+            other_numbers = item["numbers"]
+            if numbers and other_numbers and not (set(numbers) & set(other_numbers)):
                 continue
             other = item["normalized"]
+            if anchors & item.get("anchors", _telegram_finance_anchor_tokens(other)):
+                return item["result"]
             if abs(len(normalized) - len(other)) / max(len(normalized), len(other)) > 0.55:
                 continue
             if difflib.SequenceMatcher(None, normalized, other).ratio() >= threshold:
@@ -884,6 +906,7 @@ def _remember_similar_telegram_finance(payload, result):
         "time": _parse_time_ms(payload.get("timestamp")),
         "normalized": normalized,
         "numbers": _telegram_finance_number_tokens(text),
+        "anchors": _telegram_finance_anchor_tokens(normalized),
         "result": result,
     }
     with TELEGRAM_FINANCE_PROCESSED_LOCK:
@@ -1000,6 +1023,8 @@ def _post_finance_ai(text):
 
 
 def _is_timeout_error(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429
     if isinstance(exc, TimeoutError):
         return True
     if isinstance(exc, urllib.error.URLError):

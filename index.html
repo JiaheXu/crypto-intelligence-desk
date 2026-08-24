@@ -734,7 +734,7 @@ const SOURCES={
   telegram:{name:'Telegram',
     urls:['/telegram-finance-news'],
     parse(j){const arr=Array.isArray(j)?j:[];
-      return arr.map(x=>({id:'tg'+(x.id||x.msg_id||x.title),time:+x.time||Date.now(),timestamp:strip(x.timestamp||''),title:strip(x.title||x.body||''),body:strip(x.body||''),url:x.url||'#',src:x.src||'Telegram'}))}},
+      return arr.map(x=>({id:'tg'+(x.id||x.msg_id||x.title),time:+x.time||Date.now(),timestamp:strip(x.timestamp||''),title:strip(x.title||x.body||''),body:strip(x.body||''),url:x.url||'#',src:x.src||'Telegram',ai:serverAI(x.ai),ai_timeout:!!x.ai_timeout}))}},
   jinse:{name:'金色财经',
     urls:['https://api.jinse.cn/noah/v2/lives?limit=30&reading=false&source=web&flag=down&id=0&category=0',
           'https://api.jinse.com/noah/v2/lives?limit=30&reading=false&source=web&flag=down&id=0&category=0'],
@@ -811,6 +811,23 @@ let firstPoll=true, pollTimer=null;
 const ACTIVE_SOURCE_KEYS=['telegram'];
 const titleHash=t=>strip(t).replace(/[\s\p{P}]/gu,'').slice(0,42);
 const itemHash=value=>{let h=2166136261;for(const ch of String(value)){h^=ch.codePointAt(0);h=Math.imul(h,16777619)}return(h>>>0).toString(36)};
+function serverAI(a){
+  if(!a||typeof a!=='object')return null;
+  const dir=a.direction||({increase:'利好',decrease:'利空',neutral:'中性',unclear:'中性'}[a.btc_price]||'中性');
+  return {
+    direction:dir,st:a.st||dir,lt:a.lt||dir,
+    level:Math.min(5,Math.max(1,Math.round(+a.level||1))),
+    conf:Math.min(100,Math.max(0,Math.round(+a.conf||+a.confidence||50))),
+    coins:Array.isArray(a.coins)?a.coins:[],
+    affected_stocks:Array.isArray(a.affected_stocks)?a.affected_stocks:[],
+    affected_sectors:Array.isArray(a.affected_sectors)?a.affected_sectors:[],
+    positive_affected_stocks:Array.isArray(a.positive_affected_stocks)?a.positive_affected_stocks:[],
+    negative_affected_stocks:Array.isArray(a.negative_affected_stocks)?a.negative_affected_stocks:[],
+    positive_affected_sectors:Array.isArray(a.positive_affected_sectors)?a.positive_affected_sectors:[],
+    negative_affected_sectors:Array.isArray(a.negative_affected_sectors)?a.negative_affected_sectors:[],
+    cat:a.cat||'其他',priced_in:!!a.priced_in,why:a.why||a.reason||a.summary||'',reverse:a.reverse||''
+  };
+}
 
 function setHealth(k,ok,msg){const el=document.getElementById('sd_'+k);if(!el)return;
   el.className=ok?'ok':'bad';el.title=SOURCES[k].name+(ok?' · 正常':' · 失败: '+(msg||''));updateDashboard()}
@@ -846,16 +863,17 @@ async function pollAll(){
   const fresh=[];
   for(const it of items){
     it.id='n'+itemHash(`${it.src}|${it.id}|${it.title}`); // 外部数据不直接进入 DOM id
-    if(NEWS.has(it.id))continue;
+    if(NEWS.has(it.id)){
+      const old=NEWS.get(it.id);
+      if(it.ai&&!old.ai){old.ai=it.ai;renderAI(old);applyFilters()}
+      continue;
+    }
     const th=titleHash(it.title);
     if(seenTitle.has(th))continue;
     seenTitle.add(th);NEWS.set(it.id,it);fresh.push(it);
   }
   if(fresh.length){
     for(const it of fresh)renderCard(it,!firstPoll);
-    // 首次加载只分析最新5条,后续新增全部分析
-    const toAnalyze=firstPoll?fresh.slice(-5):fresh;
-    for(const it of toAnalyze)queueAnalysis(it);
     trimFeed();sortFeed();applyFilters();
   }
   firstPoll=false;
@@ -910,9 +928,8 @@ function updateDashboard(markSync=false){
 }
 
 function refreshDeskState(){
-  const conf=provConf(S.provider),ready=!!conf.key;
-  if($('#aiState')){$('#aiState').textContent=ready?'ONLINE':'未配置';$('#aiState').className='state-value'+(ready?' online':'')}
-  if($('#aiModel'))$('#aiModel').textContent=conf.model||'—';
+  if($('#aiState')){$('#aiState').textContent='PROXY';$('#aiState').className='state-value online'}
+  if($('#aiModel'))$('#aiModel').textContent='proxy.py';
   if($('#pollState'))$('#pollState').textContent=S.pollSec+' SEC';
   if($('#deepState'))$('#deepState').textContent=S.deep?'ON':'OFF';
   if($('#btnSound'))$('#btnSound').innerHTML=`<span class="btn-code">SND</span>${S.sound?'声音开启':'声音关闭'}`;
@@ -930,8 +947,9 @@ function renderCard(it,isNew){
       <a class="srclink" href="${esc(safeLink(it.url))}" target="_blank" rel="noopener noreferrer">原文 ↗</a></div>
     <div class="title" onclick="this.parentElement.classList.toggle('open')">${esc(it.title)}</div>
     ${it.body?`<div class="body" onclick="this.parentElement.classList.toggle('open')">${esc(it.body)}</div>`:''}
-    <div class="airow" id="ai_${it.id}">${hasKey()?'<span class="ai-wait">AI 分析中</span>':'<span class="mini">未配置 AI Key,<span class="alink" onclick="openModal(\'settingsModal\')">去设置</span>后可自动分析</span>'}</div>`;
+    <div class="airow" id="ai_${it.id}">${it.ai?'':it.ai_timeout?'<span class="ai-wait">代理 AI 超时，等待后台重试</span>':'<span class="ai-wait">等待代理 AI 结果</span>'}</div>`;
   $('#feed').prepend(el);
+  if(it.ai)renderAI(it);
 }
 
 /* ================= 过滤 ================= */
@@ -1077,7 +1095,7 @@ function renderSettings(){
     S.srcOn={telegram:true};S.srcUrl={};
     saveS();
     $('#saveMsg').textContent='✓ 已保存';
-    $('#setupBand').style.display=hasKey()?'none':'';
+    $('#setupBand').style.display='none';
     applyTheme();renderSrcDots();refreshDeskState();restartPoll();
     setTimeout(()=>$('#saveMsg').textContent='',2000);
   };
@@ -1089,7 +1107,7 @@ function init(){
   loadS();
   applyTheme();
   renderSrcDots();
-  $('#setupBand').style.display=hasKey()?'none':'';
+  $('#setupBand').style.display='none';
   refreshDeskState();
   $('#btnSet').onclick=()=>openModal('settingsModal');
   $('#btnCal').onclick=()=>openModal('calendarModal');

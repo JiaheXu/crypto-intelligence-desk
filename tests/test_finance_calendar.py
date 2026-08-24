@@ -268,6 +268,23 @@ company_finance_reports:
         self.assertEqual(feed[0]["timestamp"], "2026-07-07 14:00:00")
         self.assertEqual(feed[0]["title"], "Fed cuts rates")
         self.assertEqual(feed[0]["body"], "Fed cuts rates")
+        self.assertEqual(feed[0]["ai"]["summary"], "美联储暗示降息")
+        self.assertEqual(feed[0]["ai"]["btc_price"], "increase")
+
+    def test_archive_payload_keeps_ai_for_startup_feed(self):
+        payload = proxy._archive_row_payload(
+            {
+                "source": "telegram",
+                "chat_name": "tradfi",
+                "msg_id": 123,
+                "text": "Fed cuts rates",
+                "timestamp": "2026-07-07 14:00:00",
+                "ai": {"summary": "美联储暗示降息", "btc_price": "increase"},
+            }
+        )
+
+        self.assertEqual(payload["ai"]["summary"], "美联储暗示降息")
+        self.assertEqual(payload["ai"]["btc_price"], "increase")
 
     def test_telegram_finance_news_logs_compact_receive_and_ai_parse_summary(self):
         original_ai = proxy._post_finance_ai
@@ -349,6 +366,42 @@ company_finance_reports:
         self.assertFalse(result["sent"])
         self.assertEqual(feed[0]["body"], "China data preview")
         self.assertIn("[proxy] telegram finance AI timed out", out.getvalue())
+
+    def test_telegram_finance_ai_rate_limit_keeps_item_without_raising(self):
+        original_ai = proxy._post_finance_ai
+        original_send = proxy._send_receiver_packet
+        original_items = list(proxy.TELEGRAM_FINANCE_ITEMS)
+        original_processed = dict(proxy.TELEGRAM_FINANCE_PROCESSED)
+        try:
+            proxy.TELEGRAM_FINANCE_ITEMS.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy._post_finance_ai = lambda _text: (_ for _ in ()).throw(
+                proxy.urllib.error.HTTPError("https://api.example.test", 429, "Too Many Requests", None, None)
+            )
+            proxy._send_receiver_packet = lambda _packet: None
+
+            result = proxy.ingest_telegram_finance_packet(
+                {
+                    "type": "telegram_finance_news",
+                    "source": "telegram",
+                    "chat_name": "金十数据 闪电资讯",
+                    "msg_id": 126,
+                    "text": "市场消息：三星将公布100万亿韩元股东回报计划。",
+                    "timestamp": "2026-07-07 14:03:00",
+                }
+            )
+            feed = proxy.telegram_finance_feed_items()
+        finally:
+            proxy._post_finance_ai = original_ai
+            proxy._send_receiver_packet = original_send
+            proxy.TELEGRAM_FINANCE_ITEMS[:] = original_items
+            proxy.TELEGRAM_FINANCE_PROCESSED.clear()
+            proxy.TELEGRAM_FINANCE_PROCESSED.update(original_processed)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["ai_timeout"])
+        self.assertFalse(result["sent"])
+        self.assertEqual(feed[0]["body"], "市场消息：三星将公布100万亿韩元股东回报计划。")
 
     def test_telegram_finance_ai_timeout_retries_once_and_sends_if_important(self):
         class ImmediateTimer:
@@ -1016,6 +1069,17 @@ company_finance_reports:
         self.assertNotIn('"news_implication"', prompt)
         self.assertIn("Do not retry", prompt)
         self.assertIn("raw message", prompt)
+
+    def test_telegram_finance_prompt_infers_macro_policy_and_data_impact(self):
+        root = Path(__file__).resolve().parents[1]
+        prompt = (root / "prompts" / "telegram_finance_prompt.txt").read_text(encoding="utf-8")
+
+        self.assertIn("long-end bond buybacks", prompt)
+        self.assertIn("CLARITY Act", prompt)
+        self.assertIn("CPI/PPI", prompt)
+        self.assertIn("Chinese tech", prompt)
+        self.assertIn("choose btc_price, us_tech_stocks, and korean_tech_stocks", prompt)
+        self.assertIn('btc_price="increase"', prompt)
 
 
 if __name__ == "__main__":
